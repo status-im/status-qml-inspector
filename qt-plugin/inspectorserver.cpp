@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 #include <QSet>
 #include <QWidget>
+#include <QWindow>
 #include <QQuickItem>
 #include <QQuickWidget>
 #include <QQuickWindow>
@@ -16,9 +17,12 @@
 #include <QMetaMethod>
 #include <QBuffer>
 #include <QPixmap>
+#include <QImage>
 #include <QMouseEvent>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QApplication>
+#include <QGuiApplication>
 #include <QDebug>
 #include <QColor>
 #include <QUrl>
@@ -27,6 +31,7 @@
 #include <QSizeF>
 #include <QFont>
 #include <QFileDialog>
+#include <QDialog>
 
 InspectorServer::InspectorServer(QObject *parent)
     : QObject(parent)
@@ -40,7 +45,12 @@ InspectorServer::~InspectorServer()
 
 void InspectorServer::setRootWidget(QWidget *widget)
 {
-    m_rootWidget = widget;
+    m_root = widget;
+}
+
+void InspectorServer::setRootObject(QObject *root)
+{
+    m_root = root;
 }
 
 void InspectorServer::start(int port)
@@ -76,7 +86,7 @@ void InspectorServer::stop()
     }
 }
 
-InspectorServer* InspectorServer::attach(QWidget *widget, int port)
+InspectorServer* InspectorServer::attach(QObject *root, int port)
 {
     if (port == 0) {
         bool ok;
@@ -84,10 +94,81 @@ InspectorServer* InspectorServer::attach(QWidget *widget, int port)
         port = ok ? envPort : 3768;
     }
 
-    auto *inspector = new InspectorServer(widget);
-    inspector->setRootWidget(widget);
+    auto *inspector = new InspectorServer(root);
+    inspector->setRootObject(root);
     inspector->start(port);
     return inspector;
+}
+
+// --- Roots and traversal ---
+
+QList<QObject*> InspectorServer::rootObjects() const
+{
+    QList<QObject*> roots;
+    if (m_root) {
+        roots.append(m_root.data());
+        return roots;
+    }
+    for (QWindow *w : QGuiApplication::topLevelWindows())
+        roots.append(w);
+    return roots;
+}
+
+QObject* InspectorServer::defaultRoot() const
+{
+    const QList<QObject*> roots = rootObjects();
+    return roots.isEmpty() ? nullptr : roots.first();
+}
+
+QQuickWindow* InspectorServer::quickWindowFor(QObject *obj) const
+{
+    if (auto *win = qobject_cast<QQuickWindow*>(obj))
+        return win;
+    if (auto *item = qobject_cast<QQuickItem*>(obj))
+        return item->window();
+    if (auto *qw = qobject_cast<QQuickWidget*>(obj))
+        return qw->quickWindow();
+    if (auto *focus = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow()))
+        return focus;
+    for (QObject *r : rootObjects())
+        if (auto *win = qobject_cast<QQuickWindow*>(r))
+            return win;
+    return nullptr;
+}
+
+QList<QObject*> InspectorServer::searchSeeds(const QJsonObject &params, QString *error)
+{
+    QString objectId = params.value("objectId").toString();
+    if (!objectId.isEmpty()) {
+        QObject *obj = resolveObject(objectId);
+        if (!obj) {
+            *error = "Object not found: " + objectId;
+            return {};
+        }
+        return {obj};
+    }
+    QList<QObject*> roots = rootObjects();
+    if (roots.isEmpty())
+        *error = "No root object";
+    return roots;
+}
+
+void InspectorServer::enqueueChildren(QObject *obj, const std::function<void(QObject*)> &enqueue)
+{
+    if (auto *item = qobject_cast<QQuickItem*>(obj)) {
+        for (auto *child : item->childItems())
+            enqueue(child);
+    }
+    if (auto *qw = qobject_cast<QQuickWidget*>(obj)) {
+        if (qw->rootObject())
+            enqueue(qw->rootObject());
+    }
+    if (auto *win = qobject_cast<QQuickWindow*>(obj)) {
+        if (win->contentItem())
+            enqueue(win->contentItem());
+    }
+    for (auto *child : obj->children())
+        enqueue(child);
 }
 
 // --- Networking ---
@@ -209,13 +290,21 @@ QJsonObject InspectorServer::cmdGetTree(const QJsonObject &params)
     int depth = params.value("depth").toInt(4);
     QString objectId = params.value("objectId").toString();
 
-    QObject *root = nullptr;
-    if (objectId.isEmpty()) {
-        root = m_rootWidget.data();
-    } else {
-        root = resolveObject(objectId);
+    if (objectId.isEmpty() && !m_root) {
+        // Pure-QML app: a synthetic root over every top-level window.
+        QJsonObject tree;
+        tree["id"] = "";
+        tree["type"] = QString::fromUtf8(qApp ? qApp->metaObject()->className() : "QGuiApplication");
+        tree["objectName"] = qApp ? qApp->applicationName() : QString();
+        QJsonArray children;
+        for (QObject *win : rootObjects())
+            children.append(serializeObject(win, depth, 1));
+        tree["children"] = children;
+        tree["childCount"] = children.size();
+        return okResult({{"tree", tree}});
     }
 
+    QObject *root = objectId.isEmpty() ? m_root.data() : resolveObject(objectId);
     if (!root)
         return errorResult("Root object not found");
 
@@ -306,10 +395,6 @@ QJsonObject InspectorServer::cmdCallMethod(const QJsonObject &params)
     if (!obj)
         return errorResult("Object not found: " + objectId);
 
-    QVariant returnValue;
-    QGenericReturnArgument retArg;
-    bool hasReturn = false;
-
     // Find the method
     const QMetaObject *meta = obj->metaObject();
     int methodIdx = -1;
@@ -383,10 +468,15 @@ QJsonObject InspectorServer::cmdFindByType(const QJsonObject &params)
     if (typeName.isEmpty())
         return errorResult("typeName is required");
 
-    if (!m_rootWidget)
-        return errorResult("No root widget");
+    QString error;
+    const QList<QObject*> seeds = searchSeeds(params, &error);
+    if (seeds.isEmpty())
+        return errorResult(error);
 
-    QJsonArray matches = findByType(typeName, m_rootWidget.data());
+    QJsonArray matches;
+    for (QObject *seed : seeds)
+        for (const auto &m : findByType(typeName, seed))
+            matches.append(m);
     return okResult({{"matches", matches}, {"count", matches.size()}});
 }
 
@@ -399,8 +489,10 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
     QJsonValue matchValue = params.value("value");
     bool hasMatchValue = params.contains("value");
 
-    if (!m_rootWidget)
-        return errorResult("No root widget");
+    QString error;
+    const QList<QObject*> seeds = searchSeeds(params, &error);
+    if (seeds.isEmpty())
+        return errorResult(error);
 
     QJsonArray results;
     QList<QObject*> stack;
@@ -411,7 +503,8 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
             stack.append(o);
         }
     };
-    enqueue(m_rootWidget.data());
+    for (QObject *seed : seeds)
+        enqueue(seed);
 
     while (!stack.isEmpty()) {
         QObject *obj = stack.takeFirst();
@@ -429,26 +522,13 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
                 matches = (valStr == matchStr);
             }
             if (matches) {
-                QString id = registerObject(obj);
-                QJsonObject entry;
-                entry["id"] = id;
-                entry["type"] = QString::fromUtf8(obj->metaObject()->className());
-                entry["objectName"] = obj->objectName();
+                QJsonObject entry = serializeObject(obj, 0, 0);
                 entry["value"] = variantToJson(val);
                 results.append(entry);
             }
         }
 
-        QQuickItem *item = qobject_cast<QQuickItem*>(obj);
-        if (item) {
-            for (auto *child : item->childItems())
-                enqueue(child);
-        }
-        QQuickWidget *qw = qobject_cast<QQuickWidget*>(obj);
-        if (qw && qw->rootObject())
-            enqueue(qw->rootObject());
-        for (auto *child : obj->children())
-            enqueue(child);
+        enqueueChildren(obj, enqueue);
     }
 
     return okResult({{"matches", results}, {"count", results.size()}});
@@ -456,131 +536,157 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
 
 QJsonObject InspectorServer::cmdScreenshot(const QJsonObject &params)
 {
-    QWidget *target = m_rootWidget.data();
     QString objectId = params.value("objectId").toString();
+    QObject *target = objectId.isEmpty() ? defaultRoot() : resolveObject(objectId);
+    if (!target)
+        return errorResult(objectId.isEmpty() ? "No root object for screenshot"
+                                              : "Object not found: " + objectId);
 
-    if (!objectId.isEmpty()) {
-        QObject *obj = resolveObject(objectId);
-        if (!obj)
-            return errorResult("Object not found: " + objectId);
-
-        QWidget *w = qobject_cast<QWidget*>(obj);
-        if (w) target = w;
+    QImage image;
+    if (auto *w = qobject_cast<QWidget*>(target)) {
+        image = w->grab().toImage();
+    } else if (auto *win = qobject_cast<QQuickWindow*>(target)) {
+        image = win->grabWindow();
+    } else if (auto *item = qobject_cast<QQuickItem*>(target)) {
+        QQuickWindow *win = item->window();
+        if (!win)
+            return errorResult("Item has no window");
+        image = win->grabWindow();
+        const qreal dpr = image.devicePixelRatio() > 0 ? image.devicePixelRatio() : 1.0;
+        QRectF scene = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+        QRect px = QRectF(scene.x() * dpr, scene.y() * dpr,
+                          scene.width() * dpr, scene.height() * dpr).toRect()
+                   .intersected(image.rect());
+        image = image.copy(px);
+    } else {
+        return errorResult("Cannot screenshot this object type");
     }
 
-    if (!target)
-        return errorResult("No widget available for screenshot");
-
-    QPixmap pixmap = target->grab();
     QByteArray ba;
     QBuffer buf(&ba);
     buf.open(QIODevice::WriteOnly);
-    pixmap.save(&buf, "PNG");
+    image.save(&buf, "PNG");
 
     return okResult({
         {"image", QString::fromLatin1(ba.toBase64())},
-        {"width", pixmap.width()},
-        {"height", pixmap.height()},
+        {"width", image.width()},
+        {"height", image.height()},
         {"format", "png"}
     });
 }
 
 QJsonObject InspectorServer::cmdClick(const QJsonObject &params)
 {
-    if (!m_rootWidget)
-        return errorResult("No root widget");
-
-    QWidget *target = m_rootWidget.data();
-    double x, y;
-
     QString objectId = params.value("objectId").toString();
-    if (!objectId.isEmpty()) {
-        QObject *obj = resolveObject(objectId);
-        if (!obj)
-            return errorResult("Object not found: " + objectId);
+    QObject *obj = objectId.isEmpty() ? nullptr : resolveObject(objectId);
+    if (!objectId.isEmpty() && !obj)
+        return errorResult("Object not found: " + objectId);
 
-        QWidget *w = qobject_cast<QWidget*>(obj);
-        if (w) {
-            target = w;
-            x = params.contains("x") ? params.value("x").toDouble() : w->width() / 2.0;
-            y = params.contains("y") ? params.value("y").toDouble() : w->height() / 2.0;
-        } else {
-            QQuickItem *item = qobject_cast<QQuickItem*>(obj);
-            if (item && item->window()) {
-                // Map item center to scene coordinates
-                QPointF center(item->width() / 2.0, item->height() / 2.0);
-                QPointF scenePos = item->mapToScene(center);
-                // Find the QQuickWidget containing this window
-                QList<QQuickWidget*> qws = m_rootWidget->findChildren<QQuickWidget*>();
-                for (auto *qw : qws) {
-                    if (qw->quickWindow() == item->window()) {
-                        target = qw;
-                        x = scenePos.x();
-                        y = scenePos.y();
-                        break;
-                    }
-                }
-            } else {
-                return errorResult("Cannot click on this object type");
-            }
+    // Widget path (unchanged from upstream): post to the deepest child widget.
+    QWidget *widgetTarget = qobject_cast<QWidget*>(obj);
+    if (!obj && qobject_cast<QWidget*>(m_root.data()))
+        widgetTarget = qobject_cast<QWidget*>(m_root.data());
+    if (widgetTarget) {
+        double x = params.contains("x") ? params.value("x").toDouble() : widgetTarget->width() / 2.0;
+        double y = params.contains("y") ? params.value("y").toDouble() : widgetTarget->height() / 2.0;
+        QPointF pos(x, y);
+        QPointF globalPos = widgetTarget->mapToGlobal(pos.toPoint());
+        QWidget *child = widgetTarget->childAt(pos.toPoint());
+        if (child) {
+            pos = child->mapFrom(widgetTarget, pos.toPoint());
+            globalPos = child->mapToGlobal(pos.toPoint());
+            widgetTarget = child;
         }
+        QApplication::postEvent(widgetTarget, new QMouseEvent(
+            QEvent::MouseButtonPress, pos, globalPos, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier));
+        QApplication::postEvent(widgetTarget, new QMouseEvent(
+            QEvent::MouseButtonRelease, pos, globalPos, Qt::LeftButton, Qt::NoButton, Qt::NoModifier));
+        return okResult({{"clicked", true}, {"x", x}, {"y", y},
+                         {"widget", QString::fromUtf8(widgetTarget->metaObject()->className())}});
+    }
+
+    // Pure-QML path: post a press/release pair to the QQuickWindow in scene coordinates.
+    QQuickWindow *win = nullptr;
+    QPointF pos;
+    if (auto *item = qobject_cast<QQuickItem*>(obj)) {
+        win = item->window();
+        if (!win)
+            return errorResult("Item has no window");
+        QPointF local(params.contains("x") ? params.value("x").toDouble() : item->width() / 2.0,
+                      params.contains("y") ? params.value("y").toDouble() : item->height() / 2.0);
+        pos = item->mapToScene(local);
+    } else if (auto *w = qobject_cast<QQuickWindow*>(obj)) {
+        win = w;
+        pos = QPointF(params.contains("x") ? params.value("x").toDouble() : w->width() / 2.0,
+                      params.contains("y") ? params.value("y").toDouble() : w->height() / 2.0);
+    } else if (!obj) {
+        win = quickWindowFor(nullptr);
+        if (!win)
+            return errorResult("No window to click in");
+        pos = QPointF(params.value("x").toDouble(), params.value("y").toDouble());
     } else {
-        x = params.value("x").toDouble();
-        y = params.value("y").toDouble();
+        return errorResult("Cannot click on this object type");
     }
 
-    QPointF pos(x, y);
-    QPointF globalPos = target->mapToGlobal(pos.toPoint());
+    const QPointF globalPos = win->mapToGlobal(pos);
+    // Events for postEvent must be heap-allocated. Qt takes care of freeing them.
+    QCoreApplication::postEvent(win, new QMouseEvent(
+        QEvent::MouseButtonPress, pos, pos, globalPos, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier));
+    QCoreApplication::postEvent(win, new QMouseEvent(
+        QEvent::MouseButtonRelease, pos, pos, globalPos, Qt::LeftButton, Qt::NoButton, Qt::NoModifier));
 
-    // Find the deepest child widget at these coordinates
-    QWidget *child = target->childAt(pos.toPoint());
-    if (child) {
-        pos = child->mapFrom(target, pos.toPoint());
-        globalPos = child->mapToGlobal(pos.toPoint());
-        target = child;
-    }
-
-    // Events for postEvent must be heap-allocated. Qt will
-    // take care of freeing them.
-    QMouseEvent *press = new QMouseEvent(
-        QEvent::MouseButtonPress, pos, globalPos,
-        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier
-    );
-
-    QMouseEvent *release = new QMouseEvent(
-        QEvent::MouseButtonRelease, pos, globalPos,
-        Qt::LeftButton, Qt::NoButton, Qt::NoModifier
-    );
-
-    QApplication::postEvent(target, press);
-    QApplication::postEvent(target, release);
-
-    return okResult({{"clicked", true}, {"x", x}, {"y", y},
-                     {"widget", QString::fromUtf8(target->metaObject()->className())}});
+    return okResult({{"clicked", true}, {"x", pos.x()}, {"y", pos.y()},
+                     {"window", QString::fromUtf8(win->metaObject()->className())}});
 }
 
 QJsonObject InspectorServer::cmdSendKeys(const QJsonObject &params)
 {
     QString text = params.value("text").toString();
-    if (text.isEmpty())
-        return errorResult("text is required");
+    QString keyName = params.value("key").toString();
+    if (text.isEmpty() && keyName.isEmpty())
+        return errorResult("text or key is required");
 
-    QWidget *target = QApplication::focusWidget();
+    QObject *target = QApplication::focusWidget();
     if (!target)
-        target = m_rootWidget.data();
+        target = QGuiApplication::focusWindow();
     if (!target)
-        return errorResult("No focus widget");
+        target = defaultRoot();
+    if (!target)
+        return errorResult("No focus widget or window");
+
+    if (!keyName.isEmpty()) {
+        // A named key such as Return, Escape, Tab, Backspace, Ctrl+A.
+        QKeySequence seq = QKeySequence::fromString(keyName);
+        if (seq.isEmpty())
+            return errorResult("Unknown key: " + keyName);
+        const QKeyCombination combo = seq[0];
+        QKeyEvent press(QEvent::KeyPress, combo.key(), combo.keyboardModifiers());
+        QKeyEvent release(QEvent::KeyRelease, combo.key(), combo.keyboardModifiers());
+        QCoreApplication::sendEvent(target, &press);
+        QCoreApplication::sendEvent(target, &release);
+        return okResult({{"key", keyName}, {"target", QString::fromUtf8(target->metaObject()->className())}});
+    }
 
     for (const QChar &ch : text) {
         int key = ch.unicode();
         Qt::KeyboardModifiers mods = Qt::NoModifier;
         if (ch.isUpper())
             mods = Qt::ShiftModifier;
+        QString keyText(ch);
+        if (ch == QLatin1Char('\n') || ch == QLatin1Char('\r')) {
+            key = Qt::Key_Return;
+            keyText = QStringLiteral("\r");
+        } else if (ch == QLatin1Char('\t')) {
+            key = Qt::Key_Tab;
+        } else if (ch == QLatin1Char('\b')) {
+            key = Qt::Key_Backspace;
+            keyText.clear();
+        }
 
-        QKeyEvent press(QEvent::KeyPress, key, mods, QString(ch));
-        QKeyEvent release(QEvent::KeyRelease, key, mods, QString(ch));
-        QApplication::sendEvent(target, &press);
-        QApplication::sendEvent(target, &release);
+        QKeyEvent press(QEvent::KeyPress, key, mods, keyText);
+        QKeyEvent release(QEvent::KeyRelease, key, mods, keyText);
+        QCoreApplication::sendEvent(target, &press);
+        QCoreApplication::sendEvent(target, &release);
     }
 
     return okResult({{"sent", text}, {"target", QString::fromUtf8(target->metaObject()->className())}});
@@ -604,13 +710,20 @@ QJsonObject InspectorServer::cmdEvaluate(const QJsonObject &params)
     }
 
     if (!contextObj) {
-        // Find first QQuickWidget and use its root object
-        QList<QQuickWidget*> qws = m_rootWidget->findChildren<QQuickWidget*>();
-        for (auto *qw : qws) {
-            if (qw->rootObject()) {
-                contextObj = qw->rootObject();
-                break;
+        for (QObject *root : rootObjects()) {
+            if (auto *widget = qobject_cast<QWidget*>(root)) {
+                // Widgets app: first QQuickWidget's root object
+                for (auto *qw : widget->findChildren<QQuickWidget*>()) {
+                    if (qw->rootObject()) {
+                        contextObj = qw->rootObject();
+                        break;
+                    }
+                }
+            } else if (QQmlEngine::contextForObject(root)) {
+                // Pure-QML app: the window object the engine created
+                contextObj = root;
             }
+            if (contextObj) break;
         }
     }
 
@@ -643,8 +756,10 @@ QJsonObject InspectorServer::cmdFindAndClick(const QJsonObject &params)
     QString filterType = params.value("type").toString();
     bool exact = params.value("exact").toBool(false);
 
-    if (!m_rootWidget)
-        return errorResult("No root widget");
+    QString error;
+    const QList<QObject*> seeds = searchSeeds(params, &error);
+    if (seeds.isEmpty())
+        return errorResult(error);
 
     QList<QObject*> stack;
     QSet<QObject*> visited;
@@ -655,22 +770,14 @@ QJsonObject InspectorServer::cmdFindAndClick(const QJsonObject &params)
             stack.append(o);
         }
     };
-    enqueue(m_rootWidget.data());
+    for (QObject *seed : seeds)
+        enqueue(seed);
 
     while (!stack.isEmpty()) {
         QObject *obj = stack.takeFirst();
         if (!obj) continue;
 
-        QQuickItem *item = qobject_cast<QQuickItem*>(obj);
-        if (item) {
-            for (auto *child : item->childItems())
-                enqueue(child);
-        }
-        QQuickWidget *qw = qobject_cast<QQuickWidget*>(obj);
-        if (qw && qw->rootObject())
-            enqueue(qw->rootObject());
-        for (auto *child : obj->children())
-            enqueue(child);
+        enqueueChildren(obj, enqueue);
 
         QVariant textVal = obj->property("text");
         if (!textVal.isValid())
@@ -709,10 +816,10 @@ QJsonObject InspectorServer::cmdFindAndClick(const QJsonObject &params)
 
 QJsonObject InspectorServer::cmdListInteractive(const QJsonObject &params)
 {
-    Q_UNUSED(params);
-
-    if (!m_rootWidget)
-        return errorResult("No root widget");
+    QString error;
+    const QList<QObject*> seeds = searchSeeds(params, &error);
+    if (seeds.isEmpty())
+        return errorResult(error);
 
     // Type substrings that indicate interactive elements
     static const QStringList interactiveTypes = {
@@ -730,7 +837,8 @@ QJsonObject InspectorServer::cmdListInteractive(const QJsonObject &params)
             stack.append(o);
         }
     };
-    enqueue(m_rootWidget.data());
+    for (QObject *seed : seeds)
+        enqueue(seed);
 
     while (!stack.isEmpty()) {
         QObject *obj = stack.takeFirst();
@@ -785,34 +893,31 @@ QJsonObject InspectorServer::cmdListInteractive(const QJsonObject &params)
             }
         }
 
-        // Traverse children
-        QQuickItem *item = qobject_cast<QQuickItem*>(obj);
-        if (item) {
-            for (auto *child : item->childItems())
-                enqueue(child);
-        }
-        QQuickWidget *qw = qobject_cast<QQuickWidget*>(obj);
-        if (qw && qw->rootObject())
-            enqueue(qw->rootObject());
-        for (auto *child : obj->children())
-            enqueue(child);
+        enqueueChildren(obj, enqueue);
     }
 
     return okResult({{"elements", results}, {"count", results.size()}});
 }
 
 QJsonObject InspectorServer::cmdListFileDialogs(const QJsonObject &params) {
+    Q_UNUSED(params);
     // There are many more dialog types, but we start with those to make
     // life simpler.
     static const QStringList fileDialogTypes = {
         "QFileDialog", "QQuickFileDialog"
     };
 
-    QWidgetList widgets = QApplication::topLevelWidgets();
+    QList<QObject*> roots;
+    for (QWidget *w : QApplication::topLevelWidgets())
+        roots.append(w);
+    for (QObject *r : rootObjects())
+        if (!roots.contains(r))
+            roots.append(r);
+
     QJsonArray dialogs;
-    for (QString dialogType : fileDialogTypes) {
-        for (QWidget *rootWidget : widgets) {
-            for(auto item : findByType(dialogType, rootWidget)) {
+    for (const QString &dialogType : fileDialogTypes) {
+        for (QObject *root : roots) {
+            for (const auto &item : findByType(dialogType, root)) {
                 dialogs.append(item);
             }
         }
@@ -868,6 +973,19 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     result["type"] = QString::fromUtf8(obj->metaObject()->className());
     result["objectName"] = obj->objectName();
 
+    // The QML id, when the engine created the object (Squish object maps use it)
+    if (QQmlContext *ctx = QQmlEngine::contextForObject(obj)) {
+        const QString qmlId = ctx->nameForObject(obj);
+        if (!qmlId.isEmpty())
+            result["qmlId"] = qmlId;
+    }
+
+    // C++ ancestry, so a client can match a base type the way Squish reports it
+    QJsonArray inherits;
+    for (const QMetaObject *mo = obj->metaObject()->superClass(); mo; mo = mo->superClass())
+        inherits.append(QString::fromUtf8(mo->className()));
+    result["inherits"] = inherits;
+
     // Widget geometry
     QWidget *w = qobject_cast<QWidget*>(obj);
     if (w) {
@@ -876,6 +994,18 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
         result["geometry"] = QJsonObject{
             {"x", w->x()}, {"y", w->y()},
             {"width", w->width()}, {"height", w->height()}
+        };
+    }
+
+    // Top-level window geometry (QQuickWindow, QWindow)
+    QWindow *win = qobject_cast<QWindow*>(obj);
+    if (win) {
+        result["visible"] = win->isVisible();
+        result["active"] = win->isActive();
+        result["title"] = win->title();
+        result["geometry"] = QJsonObject{
+            {"x", win->x()}, {"y", win->y()},
+            {"width", win->width()}, {"height", win->height()}
         };
     }
 
@@ -945,8 +1075,14 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
                 children.append(serializeObject(child, maxDepth, currentDepth + 1));
             }
         } else {
-            // QObject/QWidget: use children()
-            for (QObject *child : obj->children()) {
+            // QObject/QWidget/QWindow: use children(); a QQuickWindow's contentItem
+            // is normally among them, but make sure it is listed.
+            QList<QObject*> objChildren = obj->children();
+            if (auto *quickWin = qobject_cast<QQuickWindow*>(obj)) {
+                if (quickWin->contentItem() && !objChildren.contains(quickWin->contentItem()))
+                    objChildren.append(quickWin->contentItem());
+            }
+            for (QObject *child : objChildren) {
                 children.append(serializeObject(child, maxDepth, currentDepth + 1));
             }
         }
@@ -1116,41 +1252,41 @@ void InspectorServer::collectObjects(QObject *root)
 {
     if (!root) return;
     registerObject(root);
-
-    QQuickItem *item = qobject_cast<QQuickItem*>(root);
-    if (item) {
-        for (auto *child : item->childItems())
-            collectObjects(child);
-    }
-
-    QQuickWidget *qw = qobject_cast<QQuickWidget*>(root);
-    if (qw && qw->rootObject())
-        collectObjects(qw->rootObject());
-
-    for (auto *child : root->children())
-        collectObjects(child);
+    enqueueChildren(root, [this](QObject *child) { collectObjects(child); });
 }
 
 // --- Helpers ---
 
 QQmlEngine* InspectorServer::findQmlEngine()
 {
-    if (!m_rootWidget)
-        return nullptr;
-
-    QList<QQuickWidget*> qws = m_rootWidget->findChildren<QQuickWidget*>();
-    for (auto *qw : qws) {
-        if (qw->engine())
-            return qw->engine();
+    for (QObject *root : rootObjects()) {
+        if (auto *widget = qobject_cast<QWidget*>(root)) {
+            for (auto *qw : widget->findChildren<QQuickWidget*>()) {
+                if (qw->engine())
+                    return qw->engine();
+            }
+            continue;
+        }
+        if (QQmlEngine *engine = qmlEngine(root))
+            return engine;
+        if (auto *win = qobject_cast<QQuickWindow*>(root)) {
+            if (win->contentItem()) {
+                for (QQuickItem *child : win->contentItem()->childItems()) {
+                    if (QQmlEngine *engine = qmlEngine(child))
+                        return engine;
+                }
+            }
+        }
     }
     return nullptr;
 }
 
 QWidget* InspectorServer::findWidgetAt(int x, int y)
 {
-    if (!m_rootWidget) return nullptr;
-    QWidget *child = m_rootWidget->childAt(x, y);
-    return child ? child : m_rootWidget.data();
+    QWidget *rootWidget = qobject_cast<QWidget*>(m_root.data());
+    if (!rootWidget) return nullptr;
+    QWidget *child = rootWidget->childAt(x, y);
+    return child ? child : rootWidget;
 }
 
 bool InspectorServer::isError(const QJsonObject &obj)
@@ -1175,7 +1311,7 @@ QJsonObject InspectorServer::okResult(const QJsonObject &data)
     return result;
 }
 
-QJsonArray InspectorServer::findByType(const QString &typeName, QWidget *root)
+QJsonArray InspectorServer::findByType(const QString &typeName, QObject *root)
 {
     // Collect all objects and filter by type
     QJsonArray results;
@@ -1189,7 +1325,7 @@ QJsonArray InspectorServer::findByType(const QString &typeName, QWidget *root)
         }
     };
 
-    stack.append(root);
+    enqueue(root);
 
     while (!stack.isEmpty()) {
         QObject *obj = stack.takeFirst();
@@ -1202,16 +1338,7 @@ QJsonArray InspectorServer::findByType(const QString &typeName, QWidget *root)
             results.append(serializeObject(obj, 0, 0));
         }
 
-        QQuickItem *item = qobject_cast<QQuickItem*>(obj);
-        if (item) {
-            for (auto *child : item->childItems())
-                enqueue(child);
-        }
-        QQuickWidget *qw = qobject_cast<QQuickWidget*>(obj);
-        if (qw && qw->rootObject())
-            enqueue(qw->rootObject());
-        for (auto *child : obj->children())
-            enqueue(child);
+        enqueueChildren(obj, enqueue);
     }
 
     return results;

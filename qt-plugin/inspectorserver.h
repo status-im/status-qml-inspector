@@ -9,10 +9,13 @@
 #include <QMap>
 #include <QList>
 
+#include <functional>
+
 class QTcpServer;
 class QTcpSocket;
 class QWidget;
 class QQuickItem;
+class QQuickWindow;
 class QQmlEngine;
 
 class InspectorServer : public QObject
@@ -24,12 +27,16 @@ public:
     ~InspectorServer();
 
     void setRootWidget(QWidget *widget);
+    /// Any QObject may be the root. nullptr means "every top-level window",
+    /// which is what a pure-QML QGuiApplication needs (no widget to hand over).
+    void setRootObject(QObject *root);
     void start(int port);
     void stop();
 
-    /// One-liner: attach to a widget and start on the given port.
+    /// One-liner: attach to a root and start on the given port.
+    /// root may be a QWidget, a QWindow, any QObject, or nullptr (see setRootObject).
     /// If port == 0, reads QML_INSPECTOR_PORT env var (default 3768).
-    static InspectorServer* attach(QWidget *widget, int port = 0);
+    static InspectorServer* attach(QObject *root, int port = 0);
 
 private slots:
     void onNewConnection();
@@ -66,6 +73,14 @@ private:
     QObject* resolveObject(const QString &id);
     void collectObjects(QObject *root);
 
+    // Roots and traversal
+    QList<QObject*> rootObjects() const;
+    QObject* defaultRoot() const;
+    QQuickWindow* quickWindowFor(QObject *obj) const;
+    /// Seeds for a search: the object named by params["objectId"], else every root.
+    QList<QObject*> searchSeeds(const QJsonObject &params, QString *error);
+    static void enqueueChildren(QObject *obj, const std::function<void(QObject*)> &enqueue);
+
     // Helpers
     QQmlEngine* findQmlEngine();
     QWidget* findWidgetAt(int x, int y);
@@ -73,7 +88,7 @@ private:
     QJsonObject okResult(const QJsonObject &data = QJsonObject());
     bool isOk(const QJsonObject &obj);
     bool isError(const QJsonObject &obj);
-    QJsonArray findByType(const QString &typeName, QWidget * = nullptr);
+    QJsonArray findByType(const QString &typeName, QObject *root);
 
     void sendResponse(QTcpSocket *socket, const QJsonObject &response);
 
@@ -81,7 +96,7 @@ private:
     QList<QTcpSocket*> m_clients;
     QMap<QTcpSocket*, QByteArray> m_buffers;
 
-    QPointer<QWidget> m_rootWidget;
+    QPointer<QObject> m_root;
 
     QMap<QString, QPointer<QObject>> m_idToObj;
     QMap<QObject*, QString> m_objToId;
