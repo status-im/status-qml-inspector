@@ -7,7 +7,9 @@
 #include <QWidget>
 #include <QWindow>
 #include <QQuickItem>
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
 #include <QQuickWidget>
+#endif
 #include <QQuickWindow>
 #include <QQmlEngine>
 #include <QQmlExpression>
@@ -126,8 +128,10 @@ QQuickWindow* InspectorServer::quickWindowFor(QObject *obj) const
         return win;
     if (auto *item = qobject_cast<QQuickItem*>(obj))
         return item->window();
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
     if (auto *qw = qobject_cast<QQuickWidget*>(obj))
         return qw->quickWindow();
+#endif
     if (auto *focus = qobject_cast<QQuickWindow*>(QGuiApplication::focusWindow()))
         return focus;
     for (QObject *r : rootObjects())
@@ -159,10 +163,12 @@ void InspectorServer::enqueueChildren(QObject *obj, const std::function<void(QOb
         for (auto *child : item->childItems())
             enqueue(child);
     }
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
     if (auto *qw = qobject_cast<QQuickWidget*>(obj)) {
         if (qw->rootObject())
             enqueue(qw->rootObject());
     }
+#endif
     if (auto *win = qobject_cast<QQuickWindow*>(obj)) {
         if (win->contentItem())
             enqueue(win->contentItem());
@@ -712,6 +718,7 @@ QJsonObject InspectorServer::cmdEvaluate(const QJsonObject &params)
     if (!contextObj) {
         for (QObject *root : rootObjects()) {
             if (auto *widget = qobject_cast<QWidget*>(root)) {
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
                 // Widgets app: first QQuickWidget's root object
                 for (auto *qw : widget->findChildren<QQuickWidget*>()) {
                     if (qw->rootObject()) {
@@ -719,6 +726,9 @@ QJsonObject InspectorServer::cmdEvaluate(const QJsonObject &params)
                         break;
                     }
                 }
+#else
+                Q_UNUSED(widget);
+#endif
             } else if (QQmlEngine::contextForObject(root)) {
                 // Pure-QML app: the window object the engine created
                 contextObj = root;
@@ -1063,11 +1073,13 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     if (currentDepth < maxDepth) {
         QJsonArray children;
 
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
         // For QQuickWidget, include the QML root item
         QQuickWidget *qw = qobject_cast<QQuickWidget*>(obj);
         if (qw && qw->rootObject()) {
             children.append(serializeObject(qw->rootObject(), maxDepth, currentDepth + 1));
         }
+#endif
 
         if (item) {
             // QQuickItem: use childItems() for visual children
@@ -1261,10 +1273,14 @@ QQmlEngine* InspectorServer::findQmlEngine()
 {
     for (QObject *root : rootObjects()) {
         if (auto *widget = qobject_cast<QWidget*>(root)) {
+#if QMLINSPECTOR_HAVE_QUICKWIDGETS
             for (auto *qw : widget->findChildren<QQuickWidget*>()) {
                 if (qw->engine())
                     return qw->engine();
             }
+#else
+            Q_UNUSED(widget);
+#endif
             continue;
         }
         if (QQmlEngine *engine = qmlEngine(root))
