@@ -7,6 +7,17 @@
 #include <QWidget>
 #include <QWindow>
 #include <QQuickItem>
+// QuickWidgets support is compiled in whenever the module is linked (Qt defines
+// QT_QUICKWIDGETS_LIB through the target's usage requirements); a build without the
+// module, such as an Android APK that does not bundle it, may force it off with
+// -DQMLINSPECTOR_HAVE_QUICKWIDGETS=0.
+#ifndef QMLINSPECTOR_HAVE_QUICKWIDGETS
+#  if defined(QT_QUICKWIDGETS_LIB) || __has_include(<QQuickWidget>)
+#    define QMLINSPECTOR_HAVE_QUICKWIDGETS 1
+#  else
+#    define QMLINSPECTOR_HAVE_QUICKWIDGETS 0
+#  endif
+#endif
 #if QMLINSPECTOR_HAVE_QUICKWIDGETS
 #include <QQuickWidget>
 #endif
