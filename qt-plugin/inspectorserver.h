@@ -38,15 +38,16 @@ public:
     /// If port == 0, reads QML_INSPECTOR_PORT env var (default 3768).
     static InspectorServer* attach(QObject *root, int port = 0);
 
+    /// Runs one request ({"id", "command", "params"}) and returns its reply.
+    /// Public for the relay client, which serves commands without a socket.
+    QJsonObject handleCommand(const QJsonObject &request);
+
 private slots:
     void onNewConnection();
     void onReadyRead();
     void onClientDisconnected();
 
 private:
-    // Command dispatch
-    QJsonObject handleCommand(const QJsonObject &request);
-
     // Command handlers
     QJsonObject cmdGetTree(const QJsonObject &params);
     QJsonObject cmdGetProperties(const QJsonObject &params);
