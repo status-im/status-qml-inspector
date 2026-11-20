@@ -25,6 +25,14 @@ cmake --build build
 
 Result: `build/plugins/generic/libqmlinspector.so`.
 
+Unit tests (the rule for the relay address):
+
+```bash
+cmake -S qt-plugin/generic-plugin/tests -B build-tests -G Ninja \
+  -DCMAKE_PREFIX_PATH=/path/to/Qt/6.11.0/gcc_64
+cmake --build build-tests && ctest --test-dir build-tests
+```
+
 ## Run
 
 The plugin never starts on its own. Start the app with:
@@ -73,6 +81,10 @@ opens no port. It polls a relay on the test machine over HTTP:
 QML_INSPECTOR_RELAY=http://localhost:<port>
 QML_INSPECTOR_TOKEN=<the session's secret>
 ```
+
+The relay address must be `http` on `localhost` or a loopback address. The
+token is sent in clear text, so the plugin refuses any other host. A tunnel on
+the device, such as BrowserStack Local, carries the request to the test machine.
 
 In this mode the plugin answers only `getTree`, `getProperties`, `findByType`
 and `findByProperty`, and returns an error for every other command: the channel

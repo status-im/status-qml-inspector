@@ -12,7 +12,7 @@
 // is loaded only when a test points QT_PLUGIN_PATH at it. An Android test build
 // carries the plugin inside the APK, so there the variable is ignored.
 //
-// With QML_INSPECTOR_RELAY=http://host:port and QML_INSPECTOR_TOKEN=<secret>
+// With QML_INSPECTOR_RELAY=http://localhost:port and QML_INSPECTOR_TOKEN=<secret>
 // the plugin dials out to that relay instead of listening (see relayclient.h).
 // It never does both.
 //
@@ -28,6 +28,7 @@
 
 #include "inspectorserver.h"
 #include "relayclient.h"
+#include "relayurl.h"
 
 static bool envIsTrue(const char *name)
 {
@@ -66,9 +67,9 @@ public:
         if (!relay.isEmpty()) {
             const QUrl url(QString::fromUtf8(relay));
             const QByteArray token = qgetenv("QML_INSPECTOR_TOKEN").trimmed();
-            if (token.isEmpty() || url.scheme() != QLatin1String("http") || url.host().isEmpty()) {
-                qWarning("[QmlInspector] QML_INSPECTOR_RELAY needs an http URL and "
-                         "QML_INSPECTOR_TOKEN; inspector stays off");
+            if (token.isEmpty() || !relayUrlAllowed(url)) {
+                qWarning("[QmlInspector] QML_INSPECTOR_RELAY needs an http URL on localhost "
+                         "and QML_INSPECTOR_TOKEN; inspector stays off");
                 return nullptr;
             }
             // Not started: in dial-out mode nothing listens.
