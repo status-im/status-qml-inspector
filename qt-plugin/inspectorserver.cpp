@@ -32,6 +32,7 @@
 #include <QPixmap>
 #include <QImage>
 #include <QMouseEvent>
+#include <QWheelEvent>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QApplication>
@@ -175,6 +176,10 @@ void InspectorServer::enqueueChildren(QObject *obj, const std::function<void(QOb
     if (auto *item = qobject_cast<QQuickItem*>(obj)) {
         for (auto *child : item->childItems())
             enqueue(child);
+        // An open popup shows as an item in the overlay. The popup object owns that item
+        // but is nobody's child item, so it is reached through the item.
+        if (item->inherits("QQuickPopupItem") && item->parent() && item->parent()->inherits("QQuickPopup"))
+            enqueue(item->parent());
     }
 #if QMLINSPECTOR_HAVE_QUICKWIDGETS
     if (auto *qw = qobject_cast<QQuickWidget*>(obj)) {
@@ -283,6 +288,12 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
         result = cmdClick(params);
     else if (command == "sendKeys")
         result = cmdSendKeys(params);
+    else if (command == "mouse")
+        result = cmdMouse(params);
+    else if (command == "geometry")
+        result = cmdGeometry(params);
+    else if (command == "wheel")
+        result = cmdWheel(params);
     else if (command == "evaluate")
         result = cmdEvaluate(params);
     else if (command == "findAndClick")
@@ -594,6 +605,8 @@ QJsonObject InspectorServer::cmdScreenshot(const QJsonObject &params)
     });
 }
 
+static void injectClick(QWindow *win, const QPointF &pos, Qt::MouseButton button);
+
 QJsonObject InspectorServer::cmdClick(const QJsonObject &params)
 {
     QString objectId = params.value("objectId").toString();
@@ -647,15 +660,148 @@ QJsonObject InspectorServer::cmdClick(const QJsonObject &params)
         return errorResult("Cannot click on this object type");
     }
 
-    const QPointF globalPos = win->mapToGlobal(pos);
-    // Events for postEvent must be heap-allocated. Qt takes care of freeing them.
-    QCoreApplication::postEvent(win, new QMouseEvent(
-        QEvent::MouseButtonPress, pos, pos, globalPos, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier));
-    QCoreApplication::postEvent(win, new QMouseEvent(
-        QEvent::MouseButtonRelease, pos, pos, globalPos, Qt::LeftButton, Qt::NoButton, Qt::NoModifier));
+    injectClick(win, pos, Qt::LeftButton);
 
     return okResult({{"clicked", true}, {"x", pos.x()}, {"y", pos.y()},
                      {"window", QString::fromUtf8(win->metaObject()->className())}});
+}
+
+// Input enters where the platform plugin hands it to Qt, as QTest does on a QWindow,
+// so grabs, hover, focus and shortcuts behave as for real input. QtGui exports these
+// functions for QTest; they are not in a public header.
+Q_GUI_EXPORT void qt_handleMouseEvent(QWindow *window, const QPointF &local, const QPointF &global,
+                                      Qt::MouseButtons state, Qt::MouseButton button,
+                                      QEvent::Type type, Qt::KeyboardModifiers mods, int timestamp);
+Q_GUI_EXPORT void qt_handleKeyEvent(QWindow *w, QEvent::Type t, int k, Qt::KeyboardModifiers mods,
+                                    const QString &text, bool autorep, ushort count);
+Q_GUI_EXPORT bool qt_sendShortcutOverrideEvent(QObject *o, ulong timestamp, int k, Qt::KeyboardModifiers mods,
+                                               const QString &text, bool autorep, ushort count);
+Q_GUI_EXPORT void qt_handleWheelEvent(QWindow *window, const QPointF &local, const QPointF &global,
+                                      QPoint pixelDelta, QPoint angleDelta, Qt::KeyboardModifiers mods,
+                                      Qt::ScrollPhase phase);
+
+static int s_inputTime = 1000;
+// Longer than the double-click interval, so two separate clicks are not one double click.
+static const int kClickGapMs = 600;
+static Qt::MouseButtons s_buttonsDown = Qt::NoButton;
+
+// Deliver what was queued, without reading this server's own sockets again.
+static void flushInput()
+{
+    QCoreApplication::processEvents(QEventLoop::ExcludeSocketNotifiers);
+}
+
+static void injectMouse(QWindow *win, const QPointF &pos, QEvent::Type type, Qt::MouseButton button)
+{
+    if (type == QEvent::MouseButtonPress)
+        s_buttonsDown |= button;
+    else if (type == QEvent::MouseButtonRelease)
+        s_buttonsDown &= ~button;
+    s_inputTime += 1;
+    qt_handleMouseEvent(win, pos, win->mapToGlobal(pos), s_buttonsDown, button, type, Qt::NoModifier, s_inputTime);
+}
+
+static void injectClick(QWindow *win, const QPointF &pos, Qt::MouseButton button)
+{
+    injectMouse(win, pos, QEvent::MouseMove, Qt::NoButton);
+    injectMouse(win, pos, QEvent::MouseButtonPress, button);
+    injectMouse(win, pos, QEvent::MouseButtonRelease, button);
+    s_inputTime += kClickGapMs;
+    flushInput();
+}
+
+static void injectKey(QWindow *win, int key, Qt::KeyboardModifiers mods, const QString &text)
+{
+    s_inputTime += 1;
+    if (!qt_sendShortcutOverrideEvent(win, s_inputTime, key, mods, text, false, 1))
+        qt_handleKeyEvent(win, QEvent::KeyPress, key, mods, text, false, 1);
+    s_inputTime += 1;
+    qt_handleKeyEvent(win, QEvent::KeyRelease, key, mods, text, false, 1);
+    flushInput();
+}
+
+// The window and scene position for a mouse or wheel command: x and y are in the
+// item's coordinates and default to its centre.
+static bool sceneTarget(QObject *obj, const QJsonObject &params, QQuickWindow **win, QPointF *pos)
+{
+    auto *item = qobject_cast<QQuickItem*>(obj);
+    if (!item || !item->window())
+        return false;
+    QPointF local(params.contains("x") ? params.value("x").toDouble() : item->width() / 2.0,
+                  params.contains("y") ? params.value("y").toDouble() : item->height() / 2.0);
+    *win = item->window();
+    *pos = item->mapToScene(local);
+    return true;
+}
+
+QJsonObject InspectorServer::cmdMouse(const QJsonObject &params)
+{
+    QObject *obj = resolveObject(params.value("objectId").toString());
+    QQuickWindow *win = nullptr;
+    QPointF pos;
+    if (!obj || !sceneTarget(obj, params, &win, &pos))
+        return errorResult("mouse needs the objectId of a QML item in a window");
+    const QString action = params.value("action").toString("click");
+    const QString name = params.value("button").toString("left");
+    const Qt::MouseButton button = name == "right" ? Qt::RightButton : name == "middle" ? Qt::MiddleButton : Qt::LeftButton;
+    if (action == "move") {
+        injectMouse(win, pos, QEvent::MouseMove, Qt::NoButton);
+        flushInput();
+    } else if (action == "press") {
+        injectMouse(win, pos, QEvent::MouseMove, Qt::NoButton);
+        injectMouse(win, pos, QEvent::MouseButtonPress, button);
+        flushInput();
+    } else if (action == "release") {
+        injectMouse(win, pos, QEvent::MouseButtonRelease, button);
+        s_inputTime += kClickGapMs;
+        flushInput();
+    } else if (action == "click") {
+        injectClick(win, pos, button);
+    } else if (action == "doubleClick") {
+        injectMouse(win, pos, QEvent::MouseMove, Qt::NoButton);
+        for (int i = 0; i < 2; ++i) {
+            injectMouse(win, pos, QEvent::MouseButtonPress, button);
+            injectMouse(win, pos, QEvent::MouseButtonRelease, button);
+        }
+        s_inputTime += kClickGapMs;
+        flushInput();
+    } else {
+        return errorResult("Unknown mouse action: " + action);
+    }
+    return okResult({{"action", action}, {"x", pos.x()}, {"y", pos.y()}});
+}
+
+// Computed here and not through `evaluate`: the QML engine crashes when asked about an
+// object that is being destroyed, such as a closing popup. A popup answers with its popup item.
+QJsonObject InspectorServer::cmdGeometry(const QJsonObject &params)
+{
+    QObject *obj = resolveObject(params.value("objectId").toString());
+    if (!obj)
+        return errorResult("Object not found");
+    auto *item = qobject_cast<QQuickItem*>(obj);
+    if (!item && obj->inherits("QQuickPopup")) {
+        if (auto *content = qobject_cast<QQuickItem*>(obj->property("contentItem").value<QObject*>()))
+            item = content->parentItem();
+    }
+    if (!item || !item->window())
+        return errorResult("Object has no place in a window");
+    const QPointF scene = item->mapToScene(QPointF(0, 0));
+    const QPointF global = item->mapToGlobal(QPointF(0, 0));
+    return okResult({{"sceneX", scene.x()}, {"sceneY", scene.y()}, {"globalX", global.x()}, {"globalY", global.y()},
+                     {"width", item->width()}, {"height", item->height()}});
+}
+
+QJsonObject InspectorServer::cmdWheel(const QJsonObject &params)
+{
+    QObject *obj = resolveObject(params.value("objectId").toString());
+    QQuickWindow *win = nullptr;
+    QPointF pos;
+    if (!obj || !sceneTarget(obj, params, &win, &pos))
+        return errorResult("wheel needs the objectId of a QML item in a window");
+    const QPoint angle(params.value("dx").toInt(), params.value("dy").toInt());
+    qt_handleWheelEvent(win, pos, win->mapToGlobal(pos), QPoint(), angle, Qt::NoModifier, Qt::NoScrollPhase);
+    flushInput();
+    return okResult({{"x", pos.x()}, {"y", pos.y()}, {"dy", angle.y()}});
 }
 
 QJsonObject InspectorServer::cmdSendKeys(const QJsonObject &params)
@@ -665,6 +811,36 @@ QJsonObject InspectorServer::cmdSendKeys(const QJsonObject &params)
     if (text.isEmpty() && keyName.isEmpty())
         return errorResult("text or key is required");
 
+    if (!QApplication::focusWidget()) {
+        QPointer<QQuickItem> keyItem = qobject_cast<QQuickItem*>(resolveObject(params.value("objectId").toString()));
+        QWindow *keyWindow = keyItem && keyItem->window() ? keyItem->window() : QGuiApplication::focusWindow();
+        if (!keyWindow)
+            keyWindow = quickWindowFor(nullptr);
+        // Something else, a page that finished loading for one, can take the focus between two keys.
+        auto injectKey = [&](QWindow *w, int key, Qt::KeyboardModifiers mods, const QString &keyText) {
+            if (keyItem && !keyItem->hasActiveFocus())
+                keyItem->forceActiveFocus();
+            ::injectKey(w, key, mods, keyText);
+        };
+        if (keyWindow) {
+            if (!keyName.isEmpty()) {
+                const QKeySequence seq = QKeySequence::fromString(keyName);
+                if (seq.isEmpty())
+                    return errorResult("Unknown key: " + keyName);
+                injectKey(keyWindow, seq[0].key(), seq[0].keyboardModifiers(), QString());
+                return okResult({{"key", keyName}, {"target", "window"}});
+            }
+            for (const QChar &ch : text) {
+                int key = ch.toUpper().unicode();
+                QString keyText(ch);
+                if (ch == QLatin1Char('\n') || ch == QLatin1Char('\r')) { key = Qt::Key_Return; keyText = QStringLiteral("\r"); }
+                else if (ch == QLatin1Char('\t')) { key = Qt::Key_Tab; }
+                else if (ch == QLatin1Char('\b')) { key = Qt::Key_Backspace; keyText.clear(); }
+                injectKey(keyWindow, key, ch.isUpper() ? Qt::ShiftModifier : Qt::NoModifier, keyText);
+            }
+            return okResult({{"sent", text}, {"target", "window"}});
+        }
+    }
     QObject *target = QApplication::focusWidget();
     if (!target)
         target = QGuiApplication::focusWindow();
@@ -756,6 +932,9 @@ QJsonObject InspectorServer::cmdEvaluate(const QJsonObject &params)
     QQmlContext *context = engine->contextForObject(contextObj);
     if (!context)
         context = engine->rootContext();
+    // Evaluating in the context of an object that is being destroyed crashes the engine.
+    if (!context->isValid())
+        return errorResult("Object is being destroyed");
 
     QQmlExpression expr(context, contextObj, expression);
     bool valueIsUndefined = false;
@@ -1224,6 +1403,17 @@ QJsonValue InspectorServer::variantToJson(const QVariant &var)
         return obj;
     }
     default:
+        // An enum is its number, as scripts compare it (checkState != 0).
+        if (var.metaType().flags().testFlag(QMetaType::IsEnumeration))
+            return var.toInt();
+        // An object-valued property is a reference the client can follow.
+        if (var.metaType().flags().testFlag(QMetaType::PointerToQObject)) {
+            QObject *o = var.value<QObject*>();
+            if (!o)
+                return QJsonValue::Null;
+            return QJsonObject{{"objectRef", registerObject(o)},
+                               {"type", QString::fromUtf8(o->metaObject()->className())}};
+        }
         // Try toString() as fallback
         if (var.canConvert<QString>())
             return var.toString();
@@ -1360,11 +1550,12 @@ QJsonArray InspectorServer::findByType(const QString &typeName, QObject *root)
         QObject *obj = stack.takeFirst();
         if (!obj) continue;
 
-        QString className = QString::fromUtf8(obj->metaObject()->className());
-        // Match exact class name or a part of it (e.g., "Button" matches "QQuickButton" or
-        // "Button_QML_TYPE_XX")
-        if (className == typeName || className.contains(typeName)) {
-            results.append(serializeObject(obj, 0, 0));
+        // The class or any base class, so a QML base type finds what derives from it.
+        for (const QMetaObject *mo = obj->metaObject(); mo; mo = mo->superClass()) {
+            if (QString::fromUtf8(mo->className()).contains(typeName)) {
+                results.append(serializeObject(obj, 0, 0));
+                break;
+            }
         }
 
         enqueueChildren(obj, enqueue);

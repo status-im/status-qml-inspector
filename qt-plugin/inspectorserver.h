@@ -58,6 +58,9 @@ private:
     QJsonObject cmdScreenshot(const QJsonObject &params);
     QJsonObject cmdClick(const QJsonObject &params);
     QJsonObject cmdSendKeys(const QJsonObject &params);
+    QJsonObject cmdMouse(const QJsonObject &params);
+    QJsonObject cmdGeometry(const QJsonObject &params);
+    QJsonObject cmdWheel(const QJsonObject &params);
     QJsonObject cmdEvaluate(const QJsonObject &params);
     QJsonObject cmdFindAndClick(const QJsonObject &params);
     QJsonObject cmdListInteractive(const QJsonObject &params);
