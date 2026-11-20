@@ -74,7 +74,9 @@ void InspectorServer::start(int port)
     m_server = new QTcpServer(this);
     connect(m_server, &QTcpServer::newConnection, this, &InspectorServer::onNewConnection);
 
-    if (!m_server->listen(QHostAddress::Any, port)) {
+    // Loopback only: the commands are unauthenticated, so nothing off the
+    // device may reach them. Tests connect from an adb shell on the device.
+    if (!m_server->listen(QHostAddress::LocalHost, port)) {
         qWarning() << "[QmlInspector] Failed to listen on port" << port
                     << ":" << m_server->errorString();
         delete m_server;
