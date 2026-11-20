@@ -7,6 +7,11 @@
 // i.e. STATUS_RUNTIME_TEST_MODE is set to a true value. With it unset the
 // plugin returns nothing, so no socket is ever opened and nothing is contacted.
 //
+// Desktop only: QML_INSPECTOR_ALLOW set to a true value starts it without test
+// mode, for tests of behaviour that test mode turns off. On desktop the plugin
+// is loaded only when a test points QT_PLUGIN_PATH at it. An Android test build
+// carries the plugin inside the APK, so there the variable is ignored.
+//
 // With QML_INSPECTOR_RELAY=http://host:port and QML_INSPECTOR_TOKEN=<secret>
 // the plugin dials out to that relay instead of listening (see relayclient.h).
 // It never does both.
@@ -24,10 +29,21 @@
 #include "inspectorserver.h"
 #include "relayclient.h"
 
-static bool statusTestModeOn()
+static bool envIsTrue(const char *name)
 {
-    const QByteArray value = qgetenv("STATUS_RUNTIME_TEST_MODE").trimmed().toLower();
+    const QByteArray value = qgetenv(name).trimmed().toLower();
     return !(value.isEmpty() || value == "0" || value == "false" || value == "no" || value == "off");
+}
+
+static bool allowedToStart()
+{
+    if (envIsTrue("STATUS_RUNTIME_TEST_MODE"))
+        return true;
+#ifdef Q_OS_ANDROID
+    return false;
+#else
+    return envIsTrue("QML_INSPECTOR_ALLOW");
+#endif
 }
 
 class QmlInspectorPlugin : public QGenericPlugin
@@ -41,7 +57,7 @@ public:
         if (key.compare(QLatin1String("qmlinspector"), Qt::CaseInsensitive) != 0)
             return nullptr;
 
-        if (!statusTestModeOn()) {
+        if (!allowedToStart()) {
             qInfo("[QmlInspector] STATUS_RUNTIME_TEST_MODE is not set; inspector stays off");
             return nullptr;
         }
