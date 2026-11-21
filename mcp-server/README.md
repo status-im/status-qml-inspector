@@ -27,7 +27,8 @@ What the server checks before a click by object:
 - No match: error, nothing is clicked.
 - More than one match: error with the candidates, nothing is clicked.
 - Hidden, disabled, or behind a modal popup: error, nothing is clicked.
-- Scrolled out of view: the list is scrolled first, then the element is clicked.
+- Scrolled out of view: the list is scrolled first (up, down or sideways), then the element is clicked.
+- In a closed drawer: the drawer is opened first, then the element is clicked.
 
 No reply is longer than 8,000 characters. A longer result is cut, with a note on how to narrow the query.
 
@@ -81,6 +82,16 @@ and set `QML_INSPECTOR_PORT` to the local port.
 
 A long list shows only the rows near its visible part. To reach other rows, scroll the list:
 `qml_set_property {ref, property: "contentY", value}`. The `scrollable` line of the list gives the range.
+
+## Drawers on a phone layout
+
+On a phone the navigation is often a drawer that is closed. A user opens it with a swipe.
+
+- A snapshot lists a closed drawer as one line, and its elements with the mark `(in closed drawer)`.
+- Click such an element like any other. The server calls `open` on the drawer, waits, then clicks.
+- The swipe itself is not done. In the Status app the swipe is handled by a native Android view, outside Qt. The plugin cannot send input there.
+- After opening, the server presses, checks that the element is `pressed`, then releases. If another item took the press, it opens the drawer again and retries, 3 times at most. The reply says how many tries it took.
+- A drawer is found like this: a visible item with `opened = false` that lies outside the window. A drawer built as a Qt Quick `Popup` is not found this way.
 
 ## Tests
 

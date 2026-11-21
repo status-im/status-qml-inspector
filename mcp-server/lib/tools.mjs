@@ -26,6 +26,7 @@ export const TOOLS = [
       "with a reference like [e12], the visible label, the objectName, the value of text fields, and marks such as (checked), (disabled), (not in view). " +
       "Cheaper and more exact than a screenshot. Use the reference with qml_click and qml_send_keys. " +
       "If a modal popup is open, only the popup is listed. " +
+      "Lines marked (in closed drawer) are in a navigation drawer that is closed now: click them like any other line, the drawer is opened first. " +
       "A line marked 'scrollable' is a list with more rows than fit: rows far outside its visible part are not listed until you scroll it " +
       "with qml_set_property {ref, property: \"contentY\", value}.",
     inputSchema: {
@@ -40,7 +41,7 @@ export const TOOLS = [
     description:
       "Click one element. Name it with ONE of: ref (from qml_snapshot), objectName, or text (the exact visible label). " +
       "The element is checked first: no match, more than one match, a hidden or disabled element, or one behind a popup is an error and nothing is clicked. " +
-      "An element that is scrolled out of view is scrolled into view first. " +
+      "An element that is scrolled out of view is scrolled into view first, and a closed drawer is opened first. " +
       "The reply lists what changed on the screen after the click, so no screenshot is needed to check it. " +
       "Clicking by (x, y) pixel coordinates relative to the main window is also possible, but it is not checked and reports no changes.",
     inputSchema: {
@@ -129,7 +130,7 @@ export const TOOLS = [
     name: "qml_find_by_type",
     description:
       "Find all QML/Qt objects matching a type name (exact or suffix match, e.g. 'Button' matches 'QQuickButton'), hidden ones too. " +
-      "One line per object. No match is an error.",
+      "One line per object. Marks: (hidden), (not on screen) for an object outside the window. No match is an error.",
     inputSchema: {
       type: "object",
       properties: { typeName: { type: "string", description: "Class/type name to search for" } },
@@ -140,7 +141,7 @@ export const TOOLS = [
     name: "qml_find_by_property",
     description:
       "Find all objects that have a given property, optionally matching a specific value, hidden ones too. " +
-      "One line per object. No match is an error.",
+      "One line per object. Marks: (hidden), (not on screen) for an object outside the window. No match is an error.",
     inputSchema: {
       type: "object",
       properties: {
@@ -273,6 +274,7 @@ export function cut(text, hint) {
 }
 
 export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs = 3000 } = {}) {
+  const drawers = new Map(); // object id -> is it a drawer; see readScreen
   const send = async (command, params = {}) => {
     const reply = await bridge.send(command, params);
     if (reply.error) throw new ToolError(`Qt Inspector error: ${reply.error}`);
@@ -282,10 +284,10 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   // Reads the screen until two reads in a row are the same, so that an animation or a page change is over.
   async function settled() {
     const end = Date.now() + settleTimeoutMs;
-    let screen = await readScreen(bridge);
+    let screen = await readScreen(bridge, drawers);
     for (;;) {
       await sleep(settleIntervalMs);
-      const next = await readScreen(bridge);
+      const next = await readScreen(bridge, drawers);
       const same = next.key === screen.key;
       screen = next;
       if (same || Date.now() >= end) return screen;
@@ -328,7 +330,8 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   // A tree object that is not a line of the list (a container, an inner part), as an element.
   function pseudo(screen, rec) {
     const base = { id: rec.id, ref: "e" + rec.id, type: rec.type, objectName: rec.objectName, kind: "object", texts: [], label: "", enabled: rec.enabled,
-                   rect: rec.rect, flick: rec.flick, behindModal: !!screen.modal && !rec.overlay, visible: screen.shown(rec), ...(rec.rect ? screen.place(rec) : { inView: false, reachable: false }) };
+                   rect: rec.rect, flick: rec.flick, behindModal: !!screen.modal && !rec.overlay, visible: screen.shown(rec),
+                   ...(rec.rect ? screen.place(rec) : { inView: false, reachable: false, drawerId: null }) };
     base.line = formatObject(rec.raw);
     return base;
   }
@@ -394,18 +397,43 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     if (el.visible === false) throw new ToolError(`${el.line} is not visible.`);
     if (!el.enabled) throw new ToolError(`${el.line} is disabled. Nothing was done.`);
     if (el.inView) return { screen, el, note: "" };
-    if (!el.flick || !el.reachable) throw new ToolError(`${el.line} is outside the window. Nothing was done.`);
-    const props = await properties(el.flick.id, ["contentY", "contentHeight", "originY"]);
+    const fresh = (after) => after.elements.find((e) => e.id === el.id) || (after.nodes.get(el.id) && after.nodes.get(el.id).item ? pseudo(after, after.nodes.get(el.id)) : null);
+    if (el.drawerId) {
+      await send("callMethod", { objectId: el.drawerId, method: "open", args: [] });
+      const after = await settled();
+      const again = fresh(after);
+      if (!again || !again.inView) throw new ToolError(`${el.line}: the drawer [e${el.drawerId}] did not open. Nothing was clicked.`);
+      return { screen: after, el: again, note: " (opened the drawer first)", drawer: true };
+    }
+    if (!el.flick || !el.reachable) {
+      throw new ToolError(`${el.line} is outside the window. Nothing was done. It is on a page that is not shown now: open that page first.`);
+    }
+    // Scroll the list along each axis on which the element is outside the visible part.
+    const props = await properties(el.flick.id, ["contentX", "contentY", "contentWidth", "contentHeight", "originX", "originY"]);
     const view = el.flick.rect;
-    const delta = el.rect.y + el.rect.h / 2 - (view.y + view.h / 2);
-    const origin = Number(props.originY) || 0;
-    const max = Math.max(origin, origin + (Number(props.contentHeight) || 0) - view.h);
-    const target = Math.round(Math.min(max, Math.max(origin, (Number(props.contentY) || 0) + delta)));
-    await send("setProperty", { objectId: el.flick.id, property: "contentY", value: target });
+    const axes = [["contentY", "y", "h", "contentHeight", "originY"], ["contentX", "x", "w", "contentWidth", "originX"]];
+    for (const [property, at, size, contentSize, originName] of axes) {
+      const centre = el.rect[at] + el.rect[size] / 2;
+      if (centre >= view[at] && centre <= view[at] + view[size]) continue;
+      const delta = centre - (view[at] + view[size] / 2);
+      const origin = Number(props[originName]) || 0;
+      const max = Math.max(origin, origin + (Number(props[contentSize]) || 0) - view[size]);
+      const target = Math.round(Math.min(max, Math.max(origin, (Number(props[property]) || 0) + delta)));
+      await send("setProperty", { objectId: el.flick.id, property, value: target });
+    }
     const after = await settled();
-    const again = after.elements.find((e) => e.id === el.id) || (after.nodes.get(el.id) && after.nodes.get(el.id).item ? pseudo(after, after.nodes.get(el.id)) : null);
+    const again = fresh(after);
     if (!again || !again.inView) throw new ToolError(`${el.line} could not be scrolled into view. Nothing was clicked.`);
     return { screen: after, el: again, note: " (scrolled into view first)" };
+  }
+
+  // Press and release as two steps, and look in between whether the element took the press.
+  // -> false when another item took it (the release then goes to that item).
+  async function pressChecked(id) {
+    await send("mouse", { objectId: id, action: "press" });
+    const props = await properties(id, ["pressed"]);
+    await send("mouse", { objectId: id, action: "release" });
+    return props.pressed !== false;
   }
 
   async function properties(objectId, names) {
@@ -430,12 +458,25 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   }
 
   async function click(args, options = {}) {
-    let screen = await settled();
-    const found = resolve(screen, args, options);
-    const state = await ready(screen, found);
-    await send("click", { objectId: state.el.id });
+    const first = await settled();
+    let screen = first, state, tries = "";
+    for (let attempt = 1; ; attempt++) {
+      const found = resolve(screen, args, options);
+      state = await ready(screen, found);
+      if (!state.drawer) {
+        await send("click", { objectId: state.el.id });
+        break;
+      }
+      // In a drawer that was just opened, another item sometimes takes the press and the drawer only closes.
+      if (await pressChecked(state.el.id)) {
+        if (attempt > 1) tries = ` It took ${attempt} tries: before, another item took the press and the drawer closed.`;
+        break;
+      }
+      if (attempt >= 3) throw new ToolError(`The press did not reach ${state.el.line} in 3 tries: another item took it each time. The element was not clicked.`);
+      screen = await settled();
+    }
     const after = await settled();
-    return ok(cut(`Clicked ${found.line.replace(/ \(not in view\)$/, "")}${state.note}.\n${changes(state.screen, after)}`, "Call qml_snapshot with a filter for the rest."));
+    return ok(cut(`Clicked ${state.el.line}${state.note}.${tries}\n${changes(state.drawer ? first : state.screen, after)}`, "Call qml_snapshot with a filter for the rest."));
   }
 
   const handlers = {
@@ -503,7 +544,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       const what = args.objectName ? `objectName "${args.objectName}"` : `text "${args.text}"`;
       const end = Date.now() + timeout;
       for (;;) {
-        const screen = await readScreen(bridge);
+        const screen = await readScreen(bridge, drawers);
         const pool = screen.elements.filter((e) => e.reachable && !e.behindModal);
         const found = pool.filter((e) => (args.objectName ? e.objectName === args.objectName
           : [e.label, ...e.texts, e.value || ""].some((t) => t.toLowerCase().includes(args.text.toLowerCase()))));
@@ -582,10 +623,17 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     return false;
   }
 
-  function matchLines(reply, none, hint, valueOf = "") {
+  // The find tools search the whole tree. A match that is shown but lies outside the window gets a mark,
+  // so that it is not taken for something a user can see.
+  async function matchLines(reply, none, hint, valueOf = "") {
     const matches = reply.matches || [];
     if (!matches.length) throw new ToolError(none);
-    const lines = matches.map((m) => formatObject(m, valueOf ? `${valueOf}=${String(JSON.stringify(m.value) ?? "").slice(0, 60)}` : ""));
+    const screen = await readScreen(bridge, drawers);
+    const offScreen = (m) => {
+      const rec = screen.nodes.get(String(m.id));
+      return !!rec && screen.shown(rec) && !screen.place(rec).inView;
+    };
+    const lines = matches.map((m) => formatObject(m, valueOf ? `${valueOf}=${String(JSON.stringify(m.value) ?? "").slice(0, 60)}` : "", offScreen(m) ? ["not on screen"] : []));
     return ok(cut([`${matches.length} object${matches.length === 1 ? "" : "s"}:`, ...lines].join("\n"), hint));
   }
 

@@ -7,9 +7,9 @@ let nextId = 1;
 // node("StatusButton", { objectName: "btnSave", text: "Save", w: 80, h: 30 }, [children])
 export function node(type, opts = {}, children = []) {
   const { inherits = [], objectName = "", visible = true, enabled = true, x = 0, y = 0, w = 100, h = 20,
-          props = {}, onClick = null, ...identifying } = opts;
+          props = {}, onClick = null, methods = {}, ...identifying } = opts;
   const n = { id: String(nextId++), type, inherits, objectName, visible, enabled, x, y, w, h,
-              props: { ...props }, onClick, identifying, children: [], parent: null };
+              props: { ...props }, onClick, methods, identifying, children: [], parent: null };
   for (const c of children) add(n, c);
   return n;
 }
@@ -32,6 +32,8 @@ export class FakeInspector {
     this.server = null;
     this.sockets = new Set();
     this.delayMs = 0;
+    this.stealPresses = 0;    // this many of the next mouse presses go to another item, as when an overlay takes the tap
+    this.onStolenClick = null;
   }
 
   // -- tree helpers
@@ -120,6 +122,10 @@ export class FakeInspector {
         }
         return { matches, count: matches.length };
       }
+      case "findByType": {
+        const matches = [...this.all()].filter((n) => n.type.split("_QMLTYPE_")[0].endsWith(params.typeName)).map((n) => this.serialize(n, 0, 0));
+        return { matches, count: matches.length };
+      }
       case "getProperties": {
         const n = target();
         const names = ["objectName", "visible", "enabled", "width", "height", "x", "y", "activeFocus",
@@ -134,6 +140,7 @@ export class FakeInspector {
         else n.props[params.property] = params.value;
         // A flickable moves its content item.
         if (params.property === "contentY" && n.children[0]) n.children[0].y = -params.value;
+        if (params.property === "contentX" && n.children[0]) n.children[0].x = -params.value;
         return { set: true };
       }
       case "geometry": {
@@ -165,9 +172,22 @@ export class FakeInspector {
         }
         return { sent: params.text, target: "window" };
       }
-      case "callMethod":
-        target();
-        return { result: null };
+      case "mouse": {
+        const n = target();
+        if (params.action === "press") {
+          if (this.stealPresses > 0) { this.stealPresses--; this.stolen = true; }
+          else n.props.pressed = true;
+        } else if (params.action === "release") {
+          if (this.stolen) { this.stolen = false; if (this.onStolenClick) this.onStolenClick(this, n); }
+          else if (n.props.pressed) { n.props.pressed = false; if (n.onClick) n.onClick(this, n); }
+        }
+        return { action: params.action, x: 0, y: 0 };
+      }
+      case "callMethod": {
+        const n = target();
+        const method = n.methods[params.method];
+        return { result: method ? method(this, n, ...(params.args || [])) ?? null : null };
+      }
       case "evaluate":
         return { result: this.evaluateResult ?? null, undefined: false };
       case "screenshot":

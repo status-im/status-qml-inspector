@@ -6,6 +6,7 @@ const INPUT_WRAPPER = /Input|TextField|TextArea|SearchBox/i;
 // Names that parts of controls carry in every instance. They do not identify an element.
 const GENERIC_NAME = /^(buttonText|buttonBackground|buttonIcon|rightTextLoader|leftTextLoader|statusBaseInput|statusRoundIcon|statusRoundImage|textContent|.*_sensor)$/;
 const LABEL_MAX = 80;
+const MAX_DRAWER_QUESTIONS = 4; // per read
 
 export const shortType = (type) => String(type || "").split(/_QMLTYPE_|_QML_/)[0];
 const inherits = (n, name) => n.type === name || (n.inherits || []).includes(name);
@@ -35,7 +36,8 @@ async function ids(bridge, property, value) {
 }
 
 // -> { window, elements, nodes (id -> record), modal, key }
-export async function readScreen(bridge) {
+// `known` remembers, per object id, whether an item outside the window is a drawer, so each one is asked once.
+export async function readScreen(bridge, known = new Map()) {
   const reply = await bridge.send("getTree", { depth: 200 });
   if (reply.error) throw new Error(`Qt Inspector error: ${reply.error}`);
   // One request at a time: small replies sent back to back wait for each other on the socket.
@@ -53,7 +55,7 @@ export async function readScreen(bridge) {
     const id = String(raw.id);
     if (raw.id !== "" && nodes.has(id)) return null;
     const rec = { id, raw, parent, type: shortType(raw.type), objectName: raw.objectName || "", children: [], visible, enabled: raw.enabled !== false,
-                  rect: null, clip, flick, overlay, win, item: false };
+                  rect: null, clip, flick, overlay, win, item: false, drawer: null };
     if (raw.id !== "") nodes.set(id, rec);
     if (isWindow(raw)) {
       rec.visible = visible = raw.visible !== false;
@@ -88,12 +90,42 @@ export async function readScreen(bridge) {
   const root = build(reply.tree, null, { x: 0, y: 0 }, true, null, null, false, null);
 
   const shown = (rec) => rec.item && rec.visible && rec.rect.w >= 2 && rec.rect.h >= 2;
+
+  // A closed drawer: a visible item that lies outside the window, holds controls, and has `opened` = false and a `position`.
+  // Only such items are asked for their properties. Asking every object for `opened` made the Status app exit during a page change.
+  const hasControl = (rec) => rec.children.some((c) => (!c.item || c.visible) && ((c.item && isStrong(c.raw)) || hasControl(c)));
+  const outside = [];
+  const seek = (rec) => {
+    if (rec.item && !rec.visible) return;
+    if (rec.item && rec.win && shown(rec)) {
+      const part = intersect({ x: 0, y: 0, w: rec.win.w, h: rec.win.h }, rec.rect);
+      if (part.w < 1 || part.h < 1) {
+        if (hasControl(rec)) outside.push(rec);
+        return;
+      }
+    }
+    rec.children.forEach(seek);
+  };
+  if (root) seek(root);
+  let asked = 0;
+  for (const rec of outside) {
+    if (!known.has(rec.id)) {
+      if (asked++ >= MAX_DRAWER_QUESTIONS) continue;
+      const reply = await bridge.send("getProperties", { objectId: rec.id });
+      const props = new Map((reply.properties || []).map((p) => [p.name, p.value]));
+      known.set(rec.id, !reply.error && props.get("opened") === false && typeof props.get("position") === "number");
+    }
+    if (!known.get(rec.id)) continue;
+    const mark = (r) => { r.drawer = rec; r.children.forEach(mark); };
+    mark(rec);
+  }
   const place = (rec) => {
     const cx = rec.rect.x + rec.rect.w / 2, cy = rec.rect.y + rec.rect.h / 2;
     const inView = !!rec.clip && contains(rec.clip, cx, cy);
     // An element outside the visible part of a list can be reached by scrolling, if the list itself is on screen.
-    const reachable = inView || (!!rec.flick && rec.flick.viewport.w > 0 && rec.flick.viewport.h > 0);
-    return { inView, reachable };
+    // An element of a closed drawer can be reached too: the drawer is opened for it.
+    const reachable = inView || !!rec.drawer || (!!rec.flick && rec.flick.viewport.w > 0 && rec.flick.viewport.h > 0);
+    return { inView, reachable, drawerId: !inView && rec.drawer ? rec.drawer.id : null };
   };
 
   // Pass 2: text fields. The editor is the object to click and type into; its wrapper carries the name and the label.
@@ -143,7 +175,9 @@ export async function readScreen(bridge) {
   const walk = (rec, quiet, owner = null) => {
     if (rec.item && !rec.visible) return;
     let childQuiet = quiet;
-    if (wrapperOf.has(rec.id)) {
+    if (rec.drawer === rec) {
+      emit(rec, { kind: "drawer" });
+    } else if (wrapperOf.has(rec.id)) {
       const editor = wrapperOf.get(rec.id);
       const placeholderNode = [rec, ...descendants(rec)].find((n) => typeof n.raw.placeholderText === "string" && n.raw.placeholderText);
       const placeholder = placeholderNode ? clean(placeholderNode.raw.placeholderText) : "";
@@ -224,6 +258,7 @@ export function formatElement(el) {
     if (el.placeholder) line += ` placeholder=${quote(el.placeholder)}`;
   }
   if (el.icon) line += ` icon=${el.icon}`;
+  if (el.kind === "drawer") return `${line} drawer: closed. Its elements are listed; a click on one of them opens the drawer first.`;
   if (el.kind === "scroll") {
     const more = [el.scroll.at > 1 ? "above" : "", el.scroll.at < el.scroll.max - 1 ? "below" : ""].filter(Boolean).join(" and ");
     line += ` scrollable: contentY=${el.scroll.at} of 0..${el.scroll.max}, more ${more}`;
@@ -232,13 +267,13 @@ export function formatElement(el) {
   if (el.checked) flags.push("checked");
   if (!el.enabled) flags.push("disabled");
   if (el.focused) flags.push("focused");
-  if (!el.inView) flags.push("not in view");
+  if (!el.inView) flags.push(el.drawerId ? "in closed drawer" : "not in view");
   if (flags.length) line += ` (${flags.join(", ")})`;
   return line;
 }
 
 // A line for an object that is not in the list (a container, a hidden object, a match of a find tool).
-export function formatObject(raw, extra = "") {
+export function formatObject(raw, extra = "", marks = []) {
   let line = `[e${raw.id}] ${shortType(raw.type)}`;
   const label = ownLabel(raw) || clean(typeof raw.placeholderText === "string" ? raw.placeholderText : "");
   if (label) line += ` ${quote(label)}`;
@@ -247,6 +282,7 @@ export function formatObject(raw, extra = "") {
   const flags = [];
   if (raw.visible === false) flags.push("hidden");
   if (raw.enabled === false) flags.push("disabled");
+  flags.push(...marks);
   if (flags.length) line += ` (${flags.join(", ")})`;
   return line;
 }
