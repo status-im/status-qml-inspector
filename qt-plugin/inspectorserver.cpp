@@ -5,6 +5,8 @@
 #include <QJsonDocument>
 #include <QSet>
 #include <QCryptographicHash>
+#include <QTimer>
+#include <QHostAddress>
 #include <QWidget>
 #include <QWindow>
 #include <QQuickItem>
@@ -47,6 +49,7 @@
 #include <QFont>
 #include <QFileDialog>
 #include <QDialog>
+#include <QJSValue>
 
 InspectorServer::InspectorServer(QObject *parent)
     : QObject(parent)
@@ -79,6 +82,23 @@ void InspectorServer::setAuthToken(const QByteArray &token)
     m_authToken = token;
 }
 
+QString InspectorServer::tokenProblem(const QByteArray &token)
+{
+    if (token.size() < kMinTokenLength)
+        return QStringLiteral("the token must have at least %1 characters").arg(kMinTokenLength);
+    return QString();
+}
+
+void InspectorServer::setAuthTimeoutMs(int ms)
+{
+    m_authTimeoutMs = ms;
+}
+
+QString InspectorServer::listenAddress() const
+{
+    return m_server ? m_server->serverAddress().toString() : QString();
+}
+
 int InspectorServer::port() const
 {
     return m_server ? m_server->serverPort() : 0;
@@ -99,6 +119,12 @@ void InspectorServer::start(int port)
     if (m_server)
         return;
 
+    // A token that is too short is not used as "no token": the server stays off.
+    if (!m_authToken.isEmpty() && !tokenProblem(m_authToken).isEmpty()) {
+        qWarning().noquote() << "[QmlInspector] Not started:" << tokenProblem(m_authToken);
+        return;
+    }
+
     m_server = new QTcpServer(this);
     connect(m_server, &QTcpServer::newConnection, this, &InspectorServer::onNewConnection);
 
@@ -114,9 +140,7 @@ void InspectorServer::start(int port)
 
     qInfo() << "[QmlInspector] Inspector server listening on port"
             << m_server->serverPort();
-    if (m_authToken.isEmpty())
-        qWarning("[QmlInspector] No QML_INSPECTOR_TOKEN: every program on this device can send commands");
-    else
+    if (!m_authToken.isEmpty())
         qInfo("[QmlInspector] Clients must send the token first");
 }
 
@@ -128,6 +152,7 @@ void InspectorServer::stop()
         m_clients.clear();
         m_buffers.clear();
         m_authenticated.clear();
+        m_lastActive.clear();
         m_server->close();
         delete m_server;
         m_server = nullptr;
@@ -144,7 +169,6 @@ InspectorServer* InspectorServer::attach(QObject *root, int port)
 
     auto *inspector = new InspectorServer(root);
     inspector->setRootObject(root);
-    inspector->setAuthToken(qgetenv("QML_INSPECTOR_TOKEN").trimmed());
     inspector->start(port);
     return inspector;
 }
@@ -230,24 +254,107 @@ void InspectorServer::enqueueChildren(QObject *obj, const std::function<void(QOb
 
 // --- Networking ---
 
+// How the places are shared, so that nobody can lock a client out by holding connections open:
+//
+// Without a token every connection may send commands at once. There are kMaxClients places. When one more
+// connection comes, the one that was idle the longest is closed, with a line that says why.
+//
+// With a token there are two groups. A connection that has not sent the token yet waits: at most kMaxWaiting
+// at a time, each for at most the auth timeout. When one more comes, the one that waits the longest is closed.
+// A waiting connection never takes a place from one that has sent the token. The connections that have sent
+// the token have kMaxClients places of their own; when one more passes the check, the one of them that was
+// idle the longest is closed.
+//
+// What stays possible: without a token, any program on the device can send commands and can push other
+// clients out (they connect again). With a token, a program without it can only push out connections that
+// are still waiting. A client that sends the token right after it connects waits for one round trip only.
 void InspectorServer::onNewConnection()
 {
+    if (!m_clock.isValid())
+        m_clock.start();
+    const bool needsToken = !m_authToken.isEmpty();
     while (m_server->hasPendingConnections()) {
         QTcpSocket *socket = m_server->nextPendingConnection();
+        if (needsToken) {
+            if (waitingCount() >= kMaxWaiting) {
+                // A token that has arrived already is checked first, so that its connection is not the one that goes.
+                const QList<QTcpSocket*> clients = m_clients;
+                for (QTcpSocket *waiting : clients) {
+                    if (m_clients.contains(waiting) && !m_authenticated.contains(waiting) && waiting->bytesAvailable() > 0)
+                        readFrom(waiting);
+                }
+            }
+            if (waitingCount() >= kMaxWaiting)
+                drop(longestIdle(false), QStringLiteral("Connection closed: too many connections wait for the token check. "
+                                                        "Send the token right after connecting."));
+        } else if (m_clients.size() >= kMaxClients) {
+            drop(longestIdle(true), QStringLiteral("Connection closed: there are more than %1 connections, and this one was idle the longest. "
+                                                   "Connect again to go on.").arg(kMaxClients));
+        }
         m_clients.append(socket);
         m_buffers[socket] = QByteArray();
+        m_lastActive[socket] = m_clock.elapsed();
         connect(socket, &QTcpSocket::readyRead, this, &InspectorServer::onReadyRead);
         connect(socket, &QTcpSocket::disconnected, this, &InspectorServer::onClientDisconnected);
         qInfo() << "[QmlInspector] Client connected from" << socket->peerAddress().toString();
+        // A connection that does not send the token in time is closed.
+        if (needsToken) {
+            QTimer::singleShot(m_authTimeoutMs, socket, [this, socket]() {
+                if (m_clients.contains(socket) && !m_authenticated.contains(socket))
+                    refuse(socket, -1, QStringLiteral("Authentication required: no token was sent in time"));
+            });
+        }
     }
+}
+
+int InspectorServer::waitingCount() const
+{
+    return m_clients.size() - m_authenticated.size();
+}
+
+// The connection that was idle the longest, among those that may send commands (`mayCommand`) or among those
+// that still wait for the token check.
+QTcpSocket *InspectorServer::longestIdle(bool mayCommand) const
+{
+    const bool needsToken = !m_authToken.isEmpty();
+    QTcpSocket *found = nullptr;
+    for (QTcpSocket *socket : m_clients) {
+        if (needsToken && m_authenticated.contains(socket) != mayCommand)
+            continue;
+        if (!found || m_lastActive.value(socket) < m_lastActive.value(found))
+            found = socket;
+    }
+    return found;
+}
+
+// Closes a connection to make room, with one line that says why. The line has no id: it answers no request.
+void InspectorServer::drop(QTcpSocket *socket, const QString &reason)
+{
+    if (!socket)
+        return;
+    qWarning().noquote() << "[QmlInspector]" << reason;
+    m_clients.removeAll(socket);
+    m_buffers.remove(socket);
+    m_authenticated.remove(socket);
+    m_lastActive.remove(socket);
+    disconnect(socket, nullptr, this, nullptr);
+    connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    sendResponse(socket, errorResult(reason));
+    socket->disconnectFromHost();
+    if (socket->state() == QAbstractSocket::UnconnectedState)
+        socket->deleteLater();
 }
 
 void InspectorServer::onReadyRead()
 {
-    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
-    if (!socket) return;
+    if (QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender()))
+        readFrom(socket);
+}
 
+void InspectorServer::readFrom(QTcpSocket *socket)
+{
     m_buffers[socket].append(socket->readAll());
+    m_lastActive[socket] = m_clock.elapsed();
 
     const bool needsToken = !m_authToken.isEmpty();
 
@@ -287,7 +394,12 @@ void InspectorServer::onReadyRead()
                 refuse(socket, id, QStringLiteral("Authentication failed: wrong token"));
                 return;
             }
-            m_authenticated.insert(socket);
+            if (needsToken && !m_authenticated.contains(socket)) {
+                if (m_authenticated.size() >= kMaxClients)
+                    drop(longestIdle(true), QStringLiteral("Connection closed: there are more than %1 connections, and this one was idle the longest. "
+                                                           "Connect again to go on.").arg(kMaxClients));
+                m_authenticated.insert(socket);
+            }
             QJsonObject reply = okResult({{"auth", needsToken ? "accepted" : "not required"}});
             if (id >= 0)
                 reply["id"] = id;
@@ -302,6 +414,9 @@ void InspectorServer::onReadyRead()
         }
 
         QJsonObject response = handleCommand(request);
+        // The command can have ended this connection (the server was stopped from inside the app).
+        if (!m_clients.contains(socket))
+            return;
         sendResponse(socket, response);
     }
 }
@@ -314,6 +429,7 @@ void InspectorServer::onClientDisconnected()
     m_clients.removeAll(socket);
     m_buffers.remove(socket);
     m_authenticated.remove(socket);
+    m_lastActive.remove(socket);
     socket->deleteLater();
     qInfo() << "[QmlInspector] Client disconnected";
 }
@@ -346,6 +462,11 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
     int id = request.value("id").toInt(-1);
 
     QJsonObject result;
+
+    // What password fields hold is left out of every reply. Their texts are looked up when the first text
+    // of a reply is checked (see secrets()), and not before: a command that sends no text back, such as a
+    // read of "pressed", does not walk the tree for it. They are looked up again for each command.
+    m_secretsCollected = false;
 
     if (command == "getTree")
         result = cmdGetTree(params);
@@ -384,10 +505,132 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
     else
         result = errorResult(QString("Unknown command: %1").arg(command));
 
+    // Tells a client that this plugin hides the text of password fields itself.
+    if (isOk(result))
+        result["secretsHidden"] = true;
+
     if (id >= 0)
         result["id"] = id;
 
     return result;
+}
+
+// --- Hidden text ---
+
+// A text field that hides what is typed: its echoMode is not Normal (0).
+// QQuickTextInput (TextInput, TextField) and QLineEdit have this property.
+static bool isEchoField(QObject *obj)
+{
+    return obj->inherits("QQuickTextInput") || obj->inherits("QLineEdit");
+}
+
+static bool hidesText(QObject *obj)
+{
+    if (!isEchoField(obj))
+        return false;
+    const QVariant mode = obj->property("echoMode");
+    return mode.isValid() && mode.toInt() != 0;
+}
+
+// The properties of such a field that hold what was typed.
+static bool isTypedTextProperty(const QByteArray &name)
+{
+    return name == "text" || name == "displayText" || name == "selectedText" || name == "preeditText";
+}
+
+// A wrapper often repeats the text of its field in a property of its own (an alias).
+// So the texts are collected first, and every string property that equals one of them is hidden too.
+void InspectorServer::collectSecrets()
+{
+    m_secrets.clear();
+    QList<QObject*> stack;
+    QSet<QObject*> visited;
+    auto enqueue = [&](QObject *o) {
+        if (o && !visited.contains(o)) {
+            visited.insert(o);
+            stack.append(o);
+        }
+    };
+    for (QObject *root : rootObjects())
+        enqueue(root);
+    while (!stack.isEmpty()) {
+        QObject *obj = stack.takeFirst();
+        if (hidesText(obj)) {
+            const QString text = obj->property("text").toString();
+            if (!text.isEmpty())
+                m_secrets.insert(text);
+        }
+        enqueueChildren(obj, enqueue);
+    }
+}
+
+// The texts that password fields hold now. Collected once per command, on first use.
+const QSet<QString> &InspectorServer::secrets()
+{
+    if (!m_secretsCollected) {
+        collectSecrets();
+        m_secretsCollected = true;
+    }
+    return m_secrets;
+}
+
+// Only a text that equals what a password field holds is hidden. A text that contains it, or is made from it,
+// is not.
+bool InspectorServer::isSecretValue(const QVariant &value)
+{
+    if (value.typeId() != QMetaType::QString)
+        return false;
+    const QString text = value.toString();
+    return !text.isEmpty() && secrets().contains(text);
+}
+
+// The same for a value that can hold texts inside it (a list, a map).
+bool InspectorServer::holdsSecret(const QVariant &value)
+{
+    switch (value.typeId()) {
+    case QMetaType::QString:
+        return isSecretValue(value);
+    case QMetaType::QStringList: {
+        const QStringList list = value.toStringList();
+        for (const QString &entry : list)
+            if (isSecretValue(entry))
+                return true;
+        return false;
+    }
+    case QMetaType::QVariantList: {
+        const QVariantList list = value.toList();
+        for (const QVariant &entry : list)
+            if (holdsSecret(entry))
+                return true;
+        return false;
+    }
+    case QMetaType::QVariantMap: {
+        const QVariantMap map = value.toMap();
+        for (auto it = map.begin(); it != map.end(); ++it)
+            if (holdsSecret(it.value()))
+                return true;
+        return false;
+    }
+    case QMetaType::Bool:
+    case QMetaType::Int:
+    case QMetaType::UInt:
+    case QMetaType::Long:
+    case QMetaType::ULong:
+    case QMetaType::LongLong:
+    case QMetaType::ULongLong:
+    case QMetaType::Short:
+    case QMetaType::UShort:
+    case QMetaType::Float:
+    case QMetaType::Double:
+        return false;
+    default:
+        if (value.userType() == qMetaTypeId<QJSValue>()) {
+            const QVariant inner = value.value<QJSValue>().toVariant();
+            return inner.userType() != qMetaTypeId<QJSValue>() && holdsSecret(inner);
+        }
+        // Every other value is sent as its text (see variantToJson).
+        return value.canConvert<QString>() && isSecretValue(value.toString());
+    }
 }
 
 // --- Command handlers ---
@@ -408,14 +651,14 @@ QJsonObject InspectorServer::cmdGetTree(const QJsonObject &params)
             children.append(serializeObject(win, depth, 1));
         tree["children"] = children;
         tree["childCount"] = children.size();
-        return okResult({{"tree", tree}});
+        return okResult({{"tree", tree}, {"states", true}});
     }
 
     QObject *root = objectId.isEmpty() ? m_root.data() : resolveObject(objectId);
     if (!root)
         return errorResult("Root object not found");
 
-    return okResult({{"tree", serializeObject(root, depth)}});
+    return okResult({{"tree", serializeObject(root, depth)}, {"states", true}});
 }
 
 QJsonObject InspectorServer::cmdGetProperties(const QJsonObject &params)
@@ -429,6 +672,37 @@ QJsonObject InspectorServer::cmdGetProperties(const QJsonObject &params)
     data["objectId"] = objectId;
     data["type"] = QString::fromUtf8(obj->metaObject()->className());
     data["objectName"] = obj->objectName();
+
+    // With "names", only these properties are read. Reading every property runs every getter of the object;
+    // on an object of a page that is being replaced this has made an app exit. A client that needs two values
+    // should ask for two.
+    if (params.contains("names")) {
+        const QMetaObject *meta = obj->metaObject();
+        const bool hides = hidesText(obj);
+        QJsonArray props;
+        const QJsonArray names = params.value("names").toArray();
+        for (const QJsonValue &entry : names) {
+            const QByteArray name = entry.toString().toUtf8();
+            const QVariant value = obj->property(name.constData());
+            if (name.isEmpty() || !value.isValid())
+                continue;
+            const int index = meta->indexOfProperty(name.constData());
+            QJsonObject p;
+            p["name"] = QString::fromUtf8(name);
+            p["type"] = index >= 0 ? QString::fromUtf8(meta->property(index).typeName()) : QStringLiteral("dynamic");
+            if ((hides && isTypedTextProperty(name)) || isSecretValue(value)) {
+                p["value"] = QJsonValue::Null;
+                p["hidden"] = true;
+            } else {
+                p["value"] = variantToJson(value);
+            }
+            p["writable"] = index >= 0 ? meta->property(index).isWritable() : true;
+            props.append(p);
+        }
+        data["properties"] = props;
+        return okResult(data);
+    }
+
     data["properties"] = serializeProperties(obj);
 
     // List methods/slots
@@ -618,6 +892,14 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
         if (!obj) continue;
 
         QVariant val = obj->property(propName.toUtf8().constData());
+        // A hidden value is never compared: a match would tell the client what it is.
+        const bool hidden = val.isValid()
+            && ((isTypedTextProperty(propName.toUtf8()) && hidesText(obj)) || isSecretValue(val));
+        // The same for a list or a map that holds such a text.
+        if (hasMatchValue && (hidden || (val.isValid() && holdsSecret(val)))) {
+            enqueueChildren(obj, enqueue);
+            continue;
+        }
         if (val.isValid()) {
             bool matches = !hasMatchValue || variantToJson(val) == matchValue;
             // Fallback: compare as strings (handles int/string mismatches like QML text bound to int)
@@ -630,7 +912,9 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
             }
             if (matches) {
                 QJsonObject entry = serializeObject(obj, 0, 0);
-                entry["value"] = variantToJson(val);
+                entry["value"] = hidden ? QJsonValue(QJsonValue::Null) : variantToJson(val);
+                if (hidden)
+                    entry["hidden"] = true;
                 results.append(entry);
             }
         }
@@ -1059,7 +1343,7 @@ QJsonObject InspectorServer::cmdFindAndClick(const QJsonObject &params)
         enqueueChildren(obj, enqueue);
 
         QVariant textVal = obj->property("text");
-        if (!textVal.isValid())
+        if (!textVal.isValid() || hidesText(obj) || isSecretValue(textVal))
             continue;
 
         QString text = textVal.toString();
@@ -1150,7 +1434,9 @@ QJsonObject InspectorServer::cmdListInteractive(const QJsonObject &params)
                 entry["objectName"] = obj->objectName();
 
                 QVariant textVal = obj->property("text");
-                if (textVal.isValid() && !textVal.toString().isEmpty())
+                if (hidesText(obj) || isSecretValue(textVal))
+                    entry["secret"] = true;
+                else if (textVal.isValid() && !textVal.toString().isEmpty())
                     entry["text"] = textVal.toString();
 
                 if (w) {
@@ -1281,7 +1567,9 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     if (win) {
         result["visible"] = win->isVisible();
         result["active"] = win->isActive();
-        result["title"] = win->title();
+        // A title is a text of the app like any other: one that equals what a password field holds is left out.
+        if (!isSecretValue(win->title()))
+            result["title"] = win->title();
         result["geometry"] = QJsonObject{
             {"x", win->x()}, {"y", win->y()},
             {"width", win->width()}, {"height", win->height()}
@@ -1303,7 +1591,8 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     // QDialog geometry.
     QDialog *dialog = qobject_cast<QDialog*>(obj);
     if (dialog) {
-        result["title"] = dialog->windowTitle();
+        if (!isSecretValue(dialog->windowTitle()))
+            result["title"] = dialog->windowTitle();
         result["visible"] = dialog->isVisible();
         result["geometry"] = QJsonObject{
             {"x", dialog->x()}, {"y", dialog->y()},
@@ -1318,18 +1607,71 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     // FIXME: this is getting pretty long, probably worth it to dismember this
     //   into type-specific and keep the main traversal logic clean.
     if (obj->inherits("QQuickAbstractDialog")) {
-        result["title"] = obj->property("title").toString();
+        if (!isSecretValue(obj->property("title")))
+            result["title"] = obj->property("title").toString();
         result["visible"] = obj->property("visible").toBool();
         // Geometry is painful cause QML uses its own "real" type - I don't even
         // know if the coordinate system is the same as the rest - so TODO. :-)
+    }
+
+    // States that a client would otherwise ask for with one search of the whole tree each
+    // ("checked", "activeFocus", "modal", "opened"). Only objects that can have the state are asked:
+    // a visible item for "checked", a popup for "modal" and "opened".
+    if (item) {
+        if (item->hasActiveFocus())
+            result["activeFocus"] = true;
+        if (item->isVisible()) {
+            const QVariant checked = obj->property("checked");
+            if (checked.typeId() == QMetaType::Bool && checked.toBool())
+                result["checked"] = true;
+        }
+    }
+    if (obj->inherits("QQuickPopup")) {
+        result["modal"] = obj->property("modal").toBool();
+        result["opened"] = obj->property("opened").toBool();
+    }
+    // The item of an open popup is a child of the overlay; the popup object that owns it is not
+    // in the item tree. So the item says which popup it belongs to.
+    if (item && item->inherits("QQuickPopupItem") && item->parent() && item->parent()->inherits("QQuickPopup")) {
+        QObject *popup = item->parent();
+        QJsonObject p{
+            {"id", registerObject(popup)},
+            {"type", QString::fromUtf8(popup->metaObject()->className())},
+            {"objectName", popup->objectName()},
+            {"modal", popup->property("modal").toBool()},
+            {"opened", popup->property("opened").toBool()}
+        };
+        const QVariant title = popup->property("title");
+        if (title.typeId() == QMetaType::QString && !title.toString().isEmpty() && !isSecretValue(title))
+            p["title"] = title.toString();
+        result["popup"] = p;
+    }
+    // Where a list is scrolled to, and how far it can go.
+    if (obj->inherits("QQuickFlickable")) {
+        for (const char *name : {"contentX", "contentY", "contentWidth", "contentHeight", "originX", "originY"})
+            result[QString::fromUtf8(name)] = obj->property(name).toDouble();
     }
 
     // Include common identifying properties in tree nodes
     static const char* identifyingProps[] = {
         "text", "title", "placeholderText", "source", "currentText", "label", nullptr
     };
+    // A password field: its text is left out. "echoMode" is sent for every such field,
+    // so a client can tell a field that shows its text from one that hides it.
+    const bool hides = hidesText(obj);
+    if (isEchoField(obj)) {
+        result["echoMode"] = obj->property("echoMode").toInt();
+        if (hides) {
+            result["secret"] = true;
+            result["textLength"] = obj->property("text").toString().size();
+        }
+    }
     for (int i = 0; identifyingProps[i]; ++i) {
         QVariant val = obj->property(identifyingProps[i]);
+        if ((hides && isTypedTextProperty(identifyingProps[i])) || isSecretValue(val)) {
+            result["secret"] = true;
+            continue;
+        }
         if (val.isValid()) {
             QJsonValue jv = variantToJson(val);
             if (!jv.isNull() && jv != QJsonValue(QString())) {
@@ -1354,6 +1696,20 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
             // QQuickItem: use childItems() for visual children
             for (QQuickItem *child : item->childItems()) {
                 children.append(serializeObject(child, maxDepth, currentDepth + 1));
+            }
+            // A popup (a dialog, a menu, a drawer) that is declared inside this item is an object,
+            // not a child item. It is listed here, so that a client can find a closed drawer.
+            // The content of an open popup is under the overlay: it is not listed a second time.
+            for (QObject *child : obj->children()) {
+                if (!child->inherits("QQuickPopup"))
+                    continue;
+                // The content of a closed popup is not on the screen, and there can be many closed dialogs and menus:
+                // it is not sent with every tree. Only a closed Drawer is sent with its content, because a click
+                // on one of its elements can open it. A client that wants the content of another popup asks for
+                // the tree of that popup (getTree with its id).
+                const bool open = child->property("opened").toBool() || child->property("visible").toBool();
+                const bool withContent = !open && child->inherits("QQuickDrawer");
+                children.append(serializeObject(child, withContent ? maxDepth : currentDepth + 1, currentDepth + 1));
             }
         } else {
             // QObject/QWidget/QWindow: use children(); a QQuickWindow's contentItem
@@ -1386,13 +1742,20 @@ QJsonArray InspectorServer::serializeProperties(QObject *obj)
 {
     QJsonArray props;
     const QMetaObject *meta = obj->metaObject();
+    const bool hides = hidesText(obj);
 
     for (int i = 0; i < meta->propertyCount(); ++i) {
         QMetaProperty prop = meta->property(i);
         QJsonObject p;
         p["name"] = QString::fromUtf8(prop.name());
         p["type"] = QString::fromUtf8(prop.typeName());
-        p["value"] = variantToJson(prop.read(obj));
+        const QVariant value = prop.read(obj);
+        if ((hides && isTypedTextProperty(prop.name())) || isSecretValue(value)) {
+            p["value"] = QJsonValue::Null;
+            p["hidden"] = true;
+        } else {
+            p["value"] = variantToJson(value);
+        }
         p["writable"] = prop.isWritable();
         props.append(p);
     }
@@ -1402,7 +1765,13 @@ QJsonArray InspectorServer::serializeProperties(QObject *obj)
         QJsonObject p;
         p["name"] = QString::fromUtf8(name);
         p["type"] = "dynamic";
-        p["value"] = variantToJson(obj->property(name.constData()));
+        const QVariant value = obj->property(name.constData());
+        if (isSecretValue(value)) {
+            p["value"] = QJsonValue::Null;
+            p["hidden"] = true;
+        } else {
+            p["value"] = variantToJson(value);
+        }
         p["writable"] = true;
         p["dynamic"] = true;
         props.append(p);
@@ -1432,6 +1801,9 @@ QJsonValue InspectorServer::variantToJson(const QVariant &var)
     case QMetaType::Double:
         return var.toDouble();
     case QMetaType::QString:
+        // The text of a password field, wherever it turns up (a list, a result of a call).
+        if (isSecretValue(var))
+            return QStringLiteral("(hidden)");
         return var.toString();
     case QMetaType::QUrl:
         return var.toUrl().toString();
@@ -1463,7 +1835,7 @@ QJsonValue InspectorServer::variantToJson(const QVariant &var)
     case QMetaType::QStringList: {
         QJsonArray arr;
         for (const auto &s : var.toStringList())
-            arr.append(s);
+            arr.append(isSecretValue(s) ? QStringLiteral("(hidden)") : s);
         return arr;
     }
     case QMetaType::QVariantList: {
@@ -1491,9 +1863,17 @@ QJsonValue InspectorServer::variantToJson(const QVariant &var)
             return QJsonObject{{"objectRef", registerObject(o)},
                                {"type", QString::fromUtf8(o->metaObject()->className())}};
         }
+        // A value of the QML engine (a "var" property that holds a list or an object).
+        if (var.userType() == qMetaTypeId<QJSValue>()) {
+            const QVariant inner = var.value<QJSValue>().toVariant();
+            if (inner.isValid() && inner.userType() != qMetaTypeId<QJSValue>())
+                return variantToJson(inner);
+        }
         // Try toString() as fallback
-        if (var.canConvert<QString>())
-            return var.toString();
+        if (var.canConvert<QString>()) {
+            const QString text = var.toString();
+            return isSecretValue(text) ? QStringLiteral("(hidden)") : text;
+        }
         return QString("<%1>").arg(QString::fromUtf8(var.typeName()));
     }
 }

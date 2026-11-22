@@ -5,8 +5,13 @@
 #include <QNetworkInterface>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <memory>
+#include <vector>
 
 #include "inspectorserver.h"
+
+// 18 characters: the server takes no token shorter than 16.
+#define TOKEN "s3cret-of-16-chars"
 
 class Client
 {
@@ -59,17 +64,124 @@ private slots:
         InspectorServer server;
         server.start(0);
         QVERIFY(server.port() > 0);
-        // A connection to another address of this machine must not reach it.
-        bool reachedElsewhere = false;
+        QCOMPARE(server.listenAddress(), QString("127.0.0.1"));
+        // A connection to another address of this machine must not reach it. One address is enough:
+        // the server has one listening socket.
         const auto addresses = QNetworkInterface::allAddresses();
         for (const QHostAddress &address : addresses) {
             if (address.isLoopback() || address.protocol() != QAbstractSocket::IPv4Protocol)
                 continue;
             QTcpSocket socket;
             socket.connectToHost(address, server.port());
-            reachedElsewhere = reachedElsewhere || socket.waitForConnected(500);
+            QVERIFY(!socket.waitForConnected(300));
+            break;
         }
-        QVERIFY(!reachedElsewhere);
+    }
+
+    void tooShortToken_serverDoesNotStart()
+    {
+        // A short token must not turn into "no token".
+        InspectorServer server;
+        server.setAuthToken("short");
+        server.start(0);
+        QCOMPARE(server.port(), 0);
+        QVERIFY(!InspectorServer::tokenProblem("short").isEmpty());
+        QVERIFY(!InspectorServer::tokenProblem("").isEmpty());
+        QVERIFY(InspectorServer::tokenProblem(TOKEN).isEmpty());
+    }
+
+    void withToken_silentConnectionIsClosedAfterTheTimeout()
+    {
+        InspectorServer server;
+        server.setAuthToken(TOKEN);
+        server.setAuthTimeoutMs(200);
+        server.start(0);
+        Client silent(server.port());
+        QVERIFY(silent.closedByServer());
+        // A connection that sent the token in time stays open after the timeout.
+        Client client(server.port());
+        QCOMPARE(client.ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
+        QTest::qWait(400);
+        QVERIFY(client.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+    }
+
+    // Without a token: connections that are held open cannot lock a client out. One more connection gets in,
+    // and the one that was idle the longest is closed with a line that says why.
+    void withoutToken_idleConnectionsCannotLockAClientOut()
+    {
+        InspectorServer server;
+        server.start(0);
+        std::vector<std::unique_ptr<Client>> idle;
+        for (int i = 0; i < InspectorServer::kMaxClients; ++i) {
+            idle.push_back(std::make_unique<Client>(server.port()));
+            QTest::qWait(5);
+        }
+        QTest::qWait(50);
+        // The first one is used again: it is no longer the one that was idle the longest.
+        QVERIFY(idle[0]->ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        Client extra(server.port());
+        QVERIFY(extra.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        const QString reason = idle[1]->sendRaw("").value("error").toString();
+        QVERIFY2(reason.startsWith("Connection closed: there are more than 8 connections"), qPrintable(reason));
+        QVERIFY(idle[1]->closedByServer());
+        QVERIFY(idle[0]->ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        QVERIFY(idle.back()->ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        // It goes on like that: there are never more than the limit, and the newest always gets in.
+        for (int i = 0; i < 20; ++i) {
+            Client more(server.port());
+            QVERIFY(more.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        }
+    }
+
+    // With a token: connections that never send it cannot lock out a client that has it.
+    void withToken_waitingConnectionsCannotLockOutAClientWithTheToken()
+    {
+        InspectorServer server;
+        server.setAuthToken(TOKEN);
+        server.setAuthTimeoutMs(60000);
+        server.start(0);
+        std::vector<std::unique_ptr<Client>> silent;
+        for (int i = 0; i < InspectorServer::kMaxWaiting; ++i) {
+            silent.push_back(std::make_unique<Client>(server.port()));
+            QTest::qWait(5);
+        }
+        Client client(server.port());
+        QCOMPARE(client.ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
+        QVERIFY(client.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        // The one that waited the longest made room, and was told why.
+        const QString reason = silent[0]->sendRaw("").value("error").toString();
+        QVERIFY2(reason.startsWith("Connection closed: too many connections wait for the token check"), qPrintable(reason));
+        QVERIFY(silent[0]->closedByServer());
+        // Many more that never send the token: the client with the token is not touched.
+        for (int i = 0; i < 30; ++i)
+            silent.push_back(std::make_unique<Client>(server.port()));
+        QTest::qWait(100);
+        QVERIFY(client.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        Client second(server.port());
+        QCOMPARE(second.ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
+    }
+
+    // With a token: the places of the connections that sent it are their own. One more with the token gets in,
+    // and the one that was idle the longest is closed with a line that says why.
+    void withToken_oneMoreWithTheTokenTakesThePlaceOfTheIdlest()
+    {
+        InspectorServer server;
+        server.setAuthToken(TOKEN);
+        server.start(0);
+        std::vector<std::unique_ptr<Client>> clients;
+        for (int i = 0; i < InspectorServer::kMaxClients; ++i) {
+            clients.push_back(std::make_unique<Client>(server.port()));
+            QCOMPARE(clients.back()->ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
+            QTest::qWait(5);
+        }
+        Client extra(server.port());
+        QCOMPARE(extra.ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
+        QVERIFY(extra.ask("getTree", {{"depth", 1}}).value("ok").toBool());
+        const QString reason = clients[0]->sendRaw("").value("error").toString();
+        QVERIFY2(reason.startsWith("Connection closed: there are more than 8 connections"), qPrintable(reason));
+        QVERIFY(clients[0]->closedByServer());
+        for (size_t i = 1; i < clients.size(); ++i)
+            QVERIFY(clients[i]->ask("getTree", {{"depth", 1}}).value("ok").toBool());
     }
 
     void withoutToken_commandsWorkAsBefore()
@@ -86,7 +198,7 @@ private slots:
     void withToken_commandBeforeAuthIsRefusedAndClosed()
     {
         InspectorServer server;
-        server.setAuthToken("s3cret");
+        server.setAuthToken(TOKEN);
         server.start(0);
         Client client(server.port());
         const QJsonObject reply = client.ask("evaluate", {{"expression", "1+1"}});
@@ -100,30 +212,30 @@ private slots:
         QTest::addColumn<QString>("given");
         QTest::newRow("other value") << "wrong";
         QTest::newRow("empty") << "";
-        QTest::newRow("prefix") << "s3cre";
-        QTest::newRow("longer") << "s3cret1";
-        QTest::newRow("other case") << "S3CRET";
+        QTest::newRow("prefix") << "s3cret-of-16-char";
+        QTest::newRow("longer") << TOKEN "1";
+        QTest::newRow("other case") << "S3CRET-OF-16-CHARS";
     }
     void withToken_wrongTokenIsRefusedAndClosed()
     {
         QFETCH(QString, given);
         InspectorServer server;
-        server.setAuthToken("s3cret");
+        server.setAuthToken(TOKEN);
         server.start(0);
         Client client(server.port());
         const QJsonObject reply = client.ask("auth", token(given));
         QVERIFY(reply.value("error").toString().startsWith("Authentication failed"));
-        QVERIFY(!QJsonDocument(reply).toJson().contains("s3cret"));
+        QVERIFY(!QJsonDocument(reply).toJson().contains(TOKEN));
         QVERIFY(client.closedByServer());
     }
 
     void withToken_rightTokenOpensThisConnectionOnly()
     {
         InspectorServer server;
-        server.setAuthToken("s3cret");
+        server.setAuthToken(TOKEN);
         server.start(0);
         Client client(server.port());
-        QCOMPARE(client.ask("auth", token("s3cret")).value("auth").toString(), QString("accepted"));
+        QCOMPARE(client.ask("auth", token(TOKEN)).value("auth").toString(), QString("accepted"));
         QVERIFY(client.ask("getTree", {{"depth", 1}}).value("ok").toBool());
 
         Client other(server.port());
@@ -136,7 +248,7 @@ private slots:
     void withToken_commandsInOnePacketAfterBadAuthAreNotRun()
     {
         InspectorServer server;
-        server.setAuthToken("s3cret");
+        server.setAuthToken(TOKEN);
         server.start(0);
         Client client(server.port());
         const QJsonObject first = client.sendRaw(
@@ -150,7 +262,7 @@ private slots:
     void withToken_longLineBeforeAuthClosesTheConnection()
     {
         InspectorServer server;
-        server.setAuthToken("s3cret");
+        server.setAuthToken(TOKEN);
         server.start(0);
         Client client(server.port());
         const QJsonObject reply = client.sendRaw(QByteArray(8000, 'x'));

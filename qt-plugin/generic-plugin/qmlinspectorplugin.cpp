@@ -4,20 +4,23 @@
 //   QT_PLUGIN_PATH=<dir holding generic/> QT_QPA_GENERIC_PLUGINS=qmlinspector[:<port>]
 //
 // The inspector is only started when status-desktop's own test mode is on,
-// i.e. STATUS_RUNTIME_TEST_MODE is set to a true value. With it unset the
-// plugin returns nothing, so no socket is ever opened and nothing is contacted.
+// i.e. STATUS_RUNTIME_TEST_MODE is set to a true value: 1, true, yes or on
+// (see envswitch.h). With it unset, or set to anything else, the plugin
+// returns nothing, so no socket is ever opened and nothing is contacted.
 //
 // Desktop only: QML_INSPECTOR_ALLOW set to a true value starts it without test
 // mode, for tests of behaviour that test mode turns off. On desktop the plugin
 // is loaded only when a test points QT_PLUGIN_PATH at it. An Android test build
 // carries the plugin inside the APK, so there the variable is ignored.
 //
-// QML_INSPECTOR_TOKEN=<secret> makes the listening server ask every connection
-// for that secret before any command (InspectorServer::setAuthToken).
-//
-// With QML_INSPECTOR_RELAY=http://localhost:port and QML_INSPECTOR_TOKEN=<secret>
-// the plugin dials out to that relay instead of listening (see relayclient.h).
-// It never does both.
+// QML_INSPECTOR_TOKEN=<secret> has one of two uses, never both:
+//   - Without QML_INSPECTOR_RELAY the plugin listens, and every connection must
+//     send that secret before any command (InspectorServer::setAuthToken).
+//     A value that is set but empty or shorter than 16 characters keeps the
+//     inspector off: it is not taken as "no token".
+//   - With QML_INSPECTOR_RELAY=http://localhost:port the plugin dials out to that
+//     relay instead of listening, and sends the secret in a header of each
+//     request, so that the relay knows the plugin (see relayclient.h).
 //
 // Generic plugins are created inside the QGuiApplication constructor, before
 // any window or QML engine exists; the server therefore starts with no root
@@ -32,11 +35,11 @@
 #include "inspectorserver.h"
 #include "relayclient.h"
 #include "relayurl.h"
+#include "envswitch.h"
 
 static bool envIsTrue(const char *name)
 {
-    const QByteArray value = qgetenv(name).trimmed().toLower();
-    return !(value.isEmpty() || value == "0" || value == "false" || value == "no" || value == "off");
+    return switchIsOn(qgetenv(name));
 }
 
 static bool allowedToStart()
@@ -62,7 +65,7 @@ public:
             return nullptr;
 
         if (!allowedToStart()) {
-            qInfo("[QmlInspector] STATUS_RUNTIME_TEST_MODE is not set; inspector stays off");
+            qInfo("[QmlInspector] STATUS_RUNTIME_TEST_MODE is not 1, true, yes or on; inspector stays off");
             return nullptr;
         }
 
@@ -83,8 +86,30 @@ public:
         }
 
         bool ok = false;
-        const int port = specification.toInt(&ok);
-        return InspectorServer::attach(nullptr, ok ? port : 0);
+        int port = specification.toInt(&ok);
+        if (!ok) {
+            port = qEnvironmentVariableIntValue("QML_INSPECTOR_PORT", &ok);
+            if (!ok)
+                port = 3768;
+        }
+
+        auto *inspector = new InspectorServer;
+        inspector->setRootObject(nullptr);
+        if (qEnvironmentVariableIsSet("QML_INSPECTOR_TOKEN")) {
+            const QByteArray token = qgetenv("QML_INSPECTOR_TOKEN").trimmed();
+            const QString problem = InspectorServer::tokenProblem(token);
+            if (!problem.isEmpty()) {
+                qWarning().noquote() << "[QmlInspector] QML_INSPECTOR_TOKEN is set but cannot be used:"
+                                     << problem << "- inspector stays off";
+                delete inspector;
+                return nullptr;
+            }
+            inspector->setAuthToken(token);
+        } else {
+            qWarning("[QmlInspector] No QML_INSPECTOR_TOKEN: every program on this device can send commands");
+        }
+        inspector->start(port);
+        return inspector;
     }
 };
 
