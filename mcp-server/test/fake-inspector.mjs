@@ -34,6 +34,9 @@ export class FakeInspector {
     this.delayMs = 0;
     this.stealPresses = 0;    // this many of the next mouse presses go to another item, as when an overlay takes the tap
     this.onStolenClick = null;
+    this.token = "";          // when set, a connection must send the auth command with this token first
+    this.oldPlugin = false;   // a plugin from before the token check: it does not know the auth command
+    this.auths = 0;           // connections that passed the token check
   }
 
   // -- tree helpers
@@ -205,6 +208,7 @@ export class FakeInspector {
       socket.setNoDelay(true);
       socket.on("close", () => this.sockets.delete(socket));
       let buffer = "";
+      let authed = false;
       socket.on("data", (chunk) => {
         buffer += chunk.toString("utf-8");
         let idx;
@@ -213,6 +217,19 @@ export class FakeInspector {
           buffer = buffer.slice(idx + 1);
           if (!line.trim()) continue;
           const request = JSON.parse(line);
+          if (!this.oldPlugin && (request.command === "auth" || (this.token && !authed))) {
+            // The same rule as the plugin: the token first, and the connection is closed on a miss.
+            const good = !this.token || (request.command === "auth" && (request.params || {}).token === this.token);
+            if (good) {
+              authed = true;
+              if (this.token) this.auths++;
+              socket.write(JSON.stringify({ id: request.id, ok: true, auth: this.token ? "accepted" : "not required" }) + "\n");
+              continue;
+            }
+            const error = request.command === "auth" ? "Authentication failed: wrong token" : "Authentication required: send the auth command with the token first";
+            socket.end(JSON.stringify({ id: request.id, error }) + "\n");
+            return;
+          }
           let reply;
           try {
             reply = { ...this.handle(request.command, request.params || {}), ok: true };

@@ -89,7 +89,7 @@ beforeEach(async () => {
   fake = new FakeInspector(app.root);
   const port = await fake.listen();
   bridge = new QtBridge({ host: "127.0.0.1", port, timeoutMs: 2000 });
-  tools = createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 80 });
+  tools = createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 80, unlimitedTools: true });
 });
 
 afterEach(async () => {
@@ -162,7 +162,7 @@ test("snapshot: a list with more rows than fit is marked scrollable, with its po
   const reply = await tools.call("qml_snapshot", {});
   assert.match(lineWith(reply, "objectName=settingsList"), /SettingsList objectName=settingsList scrollable: contentY=0 of 0\.\.400, more below$/);
   const miss = await tools.call("qml_click", { text: "Export gizmo" });
-  assert.match(text(miss), /qml_set_property/);
+  assert.match(text(miss), /qml_scroll/);
   assert.ok(lineWith(miss, "objectName=settingsList"));
 });
 
@@ -561,14 +561,14 @@ test("an unknown tool and a missing app are errors with a plain message", async 
   await fake.listen();
 });
 
-test("the tool list keeps every old tool name, adds two, and each has a description and a schema", () => {
+test("the tool list keeps every old tool name, adds three, and each has a description and a schema", () => {
   const names = tools.definitions.map((t) => t.name);
   for (const name of ["qml_find_and_click", "qml_list_interactive", "qml_screenshot", "qml_find_by_type", "qml_find_by_property", "qml_click",
                       "qml_send_keys", "qml_get_properties", "qml_set_property", "qml_call_method", "qml_evaluate", "qml_get_tree",
-                      "qml_list_file_dialogs", "qml_file_dialog_action", "qml_snapshot", "qml_wait_for"]) {
+                      "qml_list_file_dialogs", "qml_file_dialog_action", "qml_snapshot", "qml_wait_for", "qml_scroll"]) {
     assert.ok(names.includes(name), `${name} is missing`);
   }
-  assert.equal(names.length, 16);
+  assert.equal(names.length, 17);
   for (const t of tools.definitions) {
     assert.ok(t.description.length > 20, t.name);
     assert.equal(t.inputSchema.type, "object", t.name);

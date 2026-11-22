@@ -2,7 +2,9 @@
 import net from "node:net";
 
 export class QtBridge {
-  constructor({ host = "localhost", port = 3768, timeoutMs = 15000 } = {}) {
+  // token: the secret the plugin was started with (QML_INSPECTOR_TOKEN). Empty when the plugin has none.
+  constructor({ host = "localhost", port = 3768, timeoutMs = 15000, token = "" } = {}) {
+    this.token = token;
     this.host = host;
     this.port = port;
     this.timeoutMs = timeoutMs;
@@ -14,7 +16,30 @@ export class QtBridge {
 
   async connect() {
     if (this.socket && !this.socket.destroyed) return;
+    await this._open();
+    if (this.token) await this._authenticate();
+  }
 
+  // The token goes first on every new connection. The error texts never contain it.
+  async _authenticate() {
+    let reply;
+    try {
+      reply = await this._request("auth", { token: this.token });
+    } catch (err) {
+      this.close();
+      throw new Error(`Cannot connect to the inspector: no answer to the token check (${err.message}).`);
+    }
+    if (!reply.error) return;
+    this.close();
+    if (/unknown command/i.test(reply.error)) {
+      throw new Error("Cannot connect to the inspector: QML_INSPECTOR_TOKEN is set here, but the plugin in the app does not know the token check. " +
+                      "It is an older plugin and takes commands from anyone on the device. Update the plugin, or unset QML_INSPECTOR_TOKEN to use it as it is.");
+    }
+    throw new Error("Cannot connect to the inspector: the plugin did not accept the token. " +
+                    "QML_INSPECTOR_TOKEN must have the same value here and in the app.");
+  }
+
+  _open() {
     return new Promise((resolve, reject) => {
       const sock = net.createConnection({ host: this.host, port: this.port });
 
@@ -78,7 +103,16 @@ export class QtBridge {
 
   async send(command, params = {}) {
     await this.connect();
+    const reply = await this._request(command, params);
+    if (reply.error && /^Authentication required/.test(reply.error)) {
+      this.close();
+      throw new Error("Cannot connect to the inspector: the plugin asks for a token. " +
+                      "Set QML_INSPECTOR_TOKEN to the value the app was started with.");
+    }
+    return reply;
+  }
 
+  _request(command, params) {
     const id = ++this.requestId;
     const payload = JSON.stringify({ id, command, params }) + "\n";
 

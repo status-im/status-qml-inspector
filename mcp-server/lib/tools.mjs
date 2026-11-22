@@ -28,7 +28,7 @@ export const TOOLS = [
       "If a modal popup is open, only the popup is listed. " +
       "Lines marked (in closed drawer) are in a navigation drawer that is closed now: click them like any other line, the drawer is opened first. " +
       "A line marked 'scrollable' is a list with more rows than fit: rows far outside its visible part are not listed until you scroll it " +
-      "with qml_set_property {ref, property: \"contentY\", value}.",
+      "with qml_scroll {ref, y}.",
     inputSchema: {
       type: "object",
       properties: {
@@ -164,8 +164,25 @@ export const TOOLS = [
     },
   },
   {
+    name: "qml_scroll",
+    description:
+      "Scroll a list to a position. Take the list and its range from the 'scrollable' line of qml_snapshot: " +
+      "'contentY=0 of 0..591' means y can be 0 to 591. A value outside the range is moved to its nearest end. " +
+      "The reply lists the rows that came into view. To click a row you can already see in the snapshot, just click it: it is scrolled into view first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...TARGET,
+        y: { type: "number", description: "New position down the list, in the range of the 'scrollable' line" },
+        x: { type: "number", description: "New position along a sideways list" },
+      },
+    },
+  },
+  {
     name: "qml_set_property",
-    description: "Set a property value on a Qt/QML object. The reply lists what changed on the screen.",
+    description:
+      "Off by default (QML_INSPECTOR_UNLIMITED_TOOLS=1). Set any property of any object, with no check. " +
+      "It can put the app in a state a user cannot reach. The reply lists what changed on the screen.",
     inputSchema: {
       type: "object",
       properties: {
@@ -178,7 +195,9 @@ export const TOOLS = [
   },
   {
     name: "qml_call_method",
-    description: "Call a Q_INVOKABLE method or slot on a Qt/QML object. The reply lists what changed on the screen.",
+    description:
+      "Off by default (QML_INSPECTOR_UNLIMITED_TOOLS=1). Call any Q_INVOKABLE method or slot of any object, with no check. " +
+      "The reply lists what changed on the screen.",
     inputSchema: {
       type: "object",
       properties: {
@@ -192,8 +211,8 @@ export const TOOLS = [
   {
     name: "qml_evaluate",
     description:
-      "Evaluate a JavaScript expression in the QML engine context. " +
-      "Useful for reading computed values, calling JS functions, or debugging QML logic.",
+      "Off by default (QML_INSPECTOR_UNLIMITED_TOOLS=1). Run any JavaScript in the QML engine of the app, with no check. " +
+      "It can read and change everything the app can.",
     inputSchema: {
       type: "object",
       properties: {
@@ -248,6 +267,37 @@ export const TOOLS = [
   },
 ];
 
+// These three can change anything in the app, past every check the other tools make.
+// They are listed and can be called only when the server is started with QML_INSPECTOR_UNLIMITED_TOOLS=1.
+export const UNLIMITED_TOOLS = ["qml_set_property", "qml_call_method", "qml_evaluate"];
+export const UNLIMITED_SWITCH = "QML_INSPECTOR_UNLIMITED_TOOLS";
+
+// What a client may assume about each tool (MCP tool annotations). The app is a closed world: no tool reaches the internet.
+// A click or a key press is marked destructive because it does whatever the app does on that input, deleting included.
+const reads = (title) => ({ title, readOnlyHint: true, openWorldHint: false });
+const acts = (title, destructive, idempotent) =>
+  ({ title, readOnlyHint: false, destructiveHint: destructive, idempotentHint: idempotent, openWorldHint: false });
+const ANNOTATIONS = {
+  qml_snapshot: reads("List the screen"),
+  qml_list_interactive: reads("List the controls on the screen"),
+  qml_screenshot: reads("Take a screenshot"),
+  qml_wait_for: reads("Wait for an element"),
+  qml_find_by_type: reads("Find objects by type"),
+  qml_find_by_property: reads("Find objects by property"),
+  qml_get_properties: reads("Read properties"),
+  qml_get_tree: reads("Read the object tree"),
+  qml_list_file_dialogs: reads("List file dialogs"),
+  qml_click: acts("Click an element", true, false),
+  qml_find_and_click: acts("Find and click an element", true, false),
+  qml_send_keys: acts("Type text or press a key", true, false),
+  qml_scroll: acts("Scroll a list", false, true),
+  qml_file_dialog_action: acts("Use a file dialog", true, false),
+  qml_set_property: acts("Set any property (unlimited)", true, true),
+  qml_call_method: acts("Call any method (unlimited)", true, false),
+  qml_evaluate: acts("Run JavaScript in the app (unlimited)", true, false),
+};
+for (const tool of TOOLS) tool.annotations = ANNOTATIONS[tool.name];
+
 class ToolError extends Error {}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -273,7 +323,7 @@ export function cut(text, hint) {
   return `${kept.join("\n")}\n… ${more} more line${more === 1 ? "" : "s"} not shown. ${hint}`.slice(0, MAX_REPLY_CHARS);
 }
 
-export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs = 3000 } = {}) {
+export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs = 3000, unlimitedTools = false } = {}) {
   const drawers = new Map(); // object id -> is it a drawer; see readScreen
   const send = async (command, params = {}) => {
     const reply = await bridge.send(command, params);
@@ -388,7 +438,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   function scrollHint(screen) {
     const lists = screen.elements.filter((e) => e.kind === "scroll" && e.reachable && !e.behindModal);
     if (!lists.length) return "";
-    return `\nIt may be in a list that must be scrolled first. Scroll with qml_set_property {ref, property: "contentY", value}, then look again:\n${lists.slice(0, 4).map((e) => e.line).join("\n")}`;
+    return `\nIt may be in a list that must be scrolled first. Scroll with qml_scroll {ref, y}, then look again:\n${lists.slice(0, 4).map((e) => e.line).join("\n")}`;
   }
 
   // Makes sure the element can take a click, scrolling its list when needed. -> { screen, el, note }
@@ -592,6 +642,27 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       return ok(cut([`[e${id}] ${shortType(reply.type || "")}${wanted ? "" : `: ${all.length} properties`}`, ...lines].join("\n"),
                     "Pass names: [...] to get only the properties you need."));
     },
+    async qml_scroll(args) {
+      const axes = [["y", "contentY", "height", "contentHeight", "originY"], ["x", "contentX", "width", "contentWidth", "originX"]]
+        .filter(([key]) => typeof args[key] === "number" && Number.isFinite(args[key]));
+      if (!axes.length) throw new ToolError("Give the new position: y (or x for a sideways list), a number in the range of the 'scrollable' line of qml_snapshot.");
+      const id = await objectId(args);
+      const props = await properties(id, ["contentY", "contentX", "contentHeight", "contentWidth", "originY", "originX", "width", "height"]);
+      if (typeof props.contentY !== "number" || typeof props.contentHeight !== "number") {
+        throw new ToolError(`[e${id}] cannot be scrolled: it is not a list. Use the ref of a line marked 'scrollable' in qml_snapshot.`);
+      }
+      const before = await settled();
+      const done = [];
+      for (const [key, property, size, contentSize, originName] of axes) {
+        // Same scale as the 'scrollable' line: 0 is the start of the content.
+        const origin = Number(props[originName]) || 0;
+        const max = Math.max(0, Math.round((Number(props[contentSize]) || 0) - (Number(props[size]) || 0)));
+        const value = Math.min(max, Math.max(0, Math.round(args[key])));
+        await send("setProperty", { objectId: id, property, value: origin + value });
+        done.push(`${key}=${value} of 0..${max}`);
+      }
+      return ok(cut(`Scrolled [e${id}] to ${done.join(", ")}.\n${changes(before, await settled())}`, ""));
+    },
     async qml_set_property(args) {
       const id = await objectId(args);
       const before = await settled();
@@ -645,10 +716,13 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   }
 
   return {
-    definitions: TOOLS,
+    definitions: unlimitedTools ? TOOLS : TOOLS.filter((t) => !UNLIMITED_TOOLS.includes(t.name)),
     async call(name, args) {
       const handler = handlers[name];
       if (!handler) return fail(`Unknown tool: ${name}`);
+      if (!unlimitedTools && UNLIMITED_TOOLS.includes(name)) {
+        return fail(`${name} is off. It can change anything in the app, so the server offers it only when it is started with ${UNLIMITED_SWITCH}=1. Nothing was done.`);
+      }
       try {
         return await handler(args || {});
       } catch (err) {
