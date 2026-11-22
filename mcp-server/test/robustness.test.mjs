@@ -325,7 +325,9 @@ for (const plugin of PLUGINS) {
     for (const property of ["list", "obj"]) {
       const found = await tools.call("qml_find_by_property", { property });
       noSecret(found, `find ${property}`);
-      assert.match(text(found), /\(hidden\)/);
+      // Inside a list or a map a hidden value is null, and a line says that values are hidden.
+      assert.match(text(found), /null/);
+      assert.match(text(found), /values? (is|are) hidden/);
     }
     noSecret(await tools.call("qml_get_properties", { ref: "e" + app.field.id, names: ["list", "obj"] }), "get_properties");
     const byValue = await tools.call("qml_find_by_property", { property: "list", value: [SECRET, "plain"] });
@@ -403,7 +405,7 @@ test("old plugin: a method that returns the password and empties the field does 
   const tools = await start(app.root, { toolset: { unlimitedTools: true } });
   const reply = await tools.call("qml_call_method", { ref: "e" + app.field.id, method: "takeText" });
   assert.notEqual(reply.isError, true, text(reply));
-  assert.match(text(reply), /Result: "\(hidden\)"/);
+  assert.match(text(reply), /Result: null\n1 value is hidden/);
   noSecret(reply, "the result of the method");
 });
 

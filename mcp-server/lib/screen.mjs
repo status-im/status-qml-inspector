@@ -14,12 +14,18 @@ const isPopup = (n) => inherits(n, "QQuickPopup");
 const isItem = (n) => !!n.geometry && !isWindow(n);
 const isEditor = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QQuickTextEdit");
 // The Qt fields that can hide what is typed (echoMode).
-const isEchoField = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QLineEdit");
+export const isEchoField = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QLineEdit");
 const isText = (n) => inherits(n, "QQuickText");
 const isMouseArea = (n) => inherits(n, "QQuickMouseArea");
 // Parts of a control (its background, its indicator) carry the control's word in their type name.
 const PART = /Cursor|(Background|Indicator|Icon|Loader|Text|Content|Label|Panel)$/;
-const clean = (s) => String(s ?? "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+// A label can be rich text. Only what is a tag of the rich text Qt knows is taken out: "<b>", "</span>", "<br/>", "<a href=...>".
+// Plain text with the two signs in it ("5 < 10 and 7 > 3", "a<b and b>c") is kept as it is.
+const TAGS = "a|address|b|big|blockquote|body|br|center|cite|code|dd|dfn|div|dl|dt|em|font|h[1-6]|head|hr|html|i|img|kbd|li|meta|nobr|ol|p|pre|qt|s|samp|" +
+             "small|span|strong|sub|sup|table|tbody|td|tfoot|th|thead|title|tr|tt|u|ul|var";
+const TAG = new RegExp(`<(?:/(?:${TAGS})\\s*|(?:${TAGS})(?:\\s+[a-z-]+\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s"'<>]+))*\\s*/?)>`, "gi");
+const BREAK = /<(?:(?:br|hr)\s*\/?|\/(?:p|div|li|h[1-6]|tr)\s*)>/gi;
+const clean = (s) => String(s ?? "").replace(/<style(?:\s[^<>]*)?>[\s\S]*?<\/style>/gi, "").replace(BREAK, " ").replace(TAG, "").replace(/\s+/g, " ").trim();
 const ownLabel = (n) => clean(typeof n.text === "string" ? n.text : "") || clean(typeof n.title === "string" ? n.title : "") || clean(typeof n.label === "string" ? n.label : "");
 // Every text of the app goes into a line in quotes, as one JSON string: it cannot end the line or look like another field.
 const quote = (s) => JSON.stringify(s.length > LABEL_MAX ? s.slice(0, LABEL_MAX - 1) + "…" : s);
@@ -39,21 +45,22 @@ async function ids(bridge, property, value) {
 
 // ---- password fields
 //
-// What a password field holds must never reach the agent. A plugin from version 2.0 on leaves these texts out
+// What a password field holds must never reach the agent. The new plugin (the one with the password hiding, see the README) leaves these texts out
 // itself and says so in its replies (secretsHidden). For an older plugin the server finds the fields
 // (one search for echoMode) and removes their text from the reply before anything else looks at it.
 
 export const pluginHidesSecrets = (reply) => reply && reply.secretsHidden === true;
 
-// -> { ids: the fields that hide their text, values: the texts they hold }
+// -> { ids: the fields that hide their text, values: the texts they hold, shown: the fields that show their text }
 export async function findSecrets(bridge) {
   const reply = await bridge.send("findByProperty", { property: "echoMode" });
   if (reply.error) {
     throw new Error(`Qt Inspector error: could not look for password fields (${reply.error}). Nothing is shown, so that no password is shown.`);
   }
-  const found = { ids: new Set(), values: new Set() };
+  const found = { ids: new Set(), values: new Set(), shown: new Set() };
   for (const m of reply.matches || []) {
-    if (m.value === 0) continue; // 0 is Normal: the field shows its text
+    // 0 is Normal: the field shows its text
+    if (m.value === 0) { found.shown.add(String(m.id)); continue; }
     found.ids.add(String(m.id));
     if (typeof m.text === "string" && m.text) found.values.add(m.text);
   }
@@ -65,15 +72,21 @@ export async function findSecrets(bridge) {
 // The search for the fields is a second request, made after the tree was read. If the user typed in between, the field
 // held another text when the tree was read. That text is in the tree itself (one reply is one moment in the app),
 // so the texts of the fields are taken from the tree too.
+// A field can also go away between the two requests (Return on a login page closes the page). The search does not
+// find it then, and nothing says whether it hid its text. So a field of the tree counts as a password field unless
+// the search has confirmed that it shows its text (secrets.shown): what is not known is hidden.
 export function hideSecrets(raw, secrets) {
   const values = new Set(secrets.values);
+  const ids = new Set(secrets.ids);
+  const shown = secrets.shown || new Set();
   const collect = (n) => {
     if (!n || typeof n !== "object") return;
-    if (secrets.ids.has(String(n.id))) for (const key of TEXT_KEYS) if (typeof n[key] === "string" && n[key]) values.add(n[key]);
+    if (isEchoField(n) && n.id !== undefined && !shown.has(String(n.id))) ids.add(String(n.id));
+    if (ids.has(String(n.id))) for (const key of TEXT_KEYS) if (typeof n[key] === "string" && n[key]) values.add(n[key]);
     for (const child of n.children || []) collect(child);
   };
   collect(raw);
-  return hideIn(raw, { ids: secrets.ids, values });
+  return hideIn(raw, { ids, values });
 }
 
 function hideIn(raw, secrets) {
@@ -141,7 +154,7 @@ async function interpret(bridge, reply, known, profile, light, settled) {
     if (hasField) hideSecrets(reply.tree, await findSecrets(bridge));
   }
 
-  // The states of the elements. A plugin from 2.0 on sends them with the tree. For an older plugin each state
+  // The states of the elements. The new plugin sends them with the tree. For the old plugin each state
   // is one search of the whole tree. One request at a time: small replies sent back to back wait for each other on the socket.
   const fromTree = reply.states === true;
   let checked = new Map(), focused = new Map(), modal = null;
@@ -216,6 +229,25 @@ async function interpret(bridge, reply, known, profile, light, settled) {
 
   const shown = (rec) => rec.item && rec.visible && rec.rect.w >= 2 && rec.rect.h >= 2;
 
+  // Open popups (a menu, the list of a combo box, a dialog, a tooltip). The item of each one is a child of the overlay
+  // and lies over the page; a later one lies over an earlier one. A click on a place that such an item covers goes to
+  // the popup, whether the popup is modal or not. So an element whose middle is under a popup item that it is not
+  // a part of cannot be clicked now.
+  const popupItems = [...nodes.values()].filter((rec) => rec.item && rec.overlay && inherits(rec.raw, "QQuickPopupItem") && shown(rec));
+  const coverOf = (rec, rect) => {
+    if (!popupItems.length || !rect) return null;
+    let own = -1;
+    for (let p = rec; p && own === -1; p = p.parent) own = popupItems.indexOf(p);
+    const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+    for (let k = popupItems.length - 1; k > own; k--) if (contains(popupItems[k].rect, cx, cy)) return popupItems[k];
+    return null;
+  };
+  const popupName = (rec) => {
+    const popup = rec.raw.popup || {};
+    const title = clean(typeof popup.title === "string" ? popup.title : "");
+    return `[e${rec.id}] ${shortType(popup.type || rec.raw.type)}${title ? " " + JSON.stringify(title) : ""}`;
+  };
+
   if (!light && fromTree) {
     // Same order as the searches of an older plugin: level by level, and the last open modal popup counts.
     const queue = root ? [root] : [];
@@ -272,7 +304,9 @@ async function interpret(bridge, reply, known, profile, light, settled) {
     // An element outside the visible part of a list can be reached by scrolling, if the list itself is on screen.
     // An element of a closed drawer can be reached too: the drawer is opened for it.
     const reachable = inView || !!rec.drawer || (!!rec.flick && rec.flick.viewport.w > 0 && rec.flick.viewport.h > 0);
-    return { inView, reachable, drawerId: !inView && rec.drawer ? rec.drawer.id : null };
+    // Only an element in view is checked: one that must be scrolled into view first is checked after the scroll.
+    const cover = inView ? coverOf(rec, rec.rect) : null;
+    return { inView, reachable, drawerId: !inView && rec.drawer ? rec.drawer.id : null, covered: !!cover, coveredBy: cover ? popupName(cover) : "" };
   };
 
   // Pass 2: text fields. The editor is the object to click and type into; its wrapper carries the name and the label.
@@ -295,8 +329,8 @@ async function interpret(bridge, reply, known, profile, light, settled) {
     if (!wrapperOf.has(wrapper.id)) wrapperOf.set(wrapper.id, rec);
   }
 
-  // Lists that can be scrolled: where they are and how far they go. A plugin from 2.0 on sends this with the tree.
-  // With an older plugin the position is taken from the geometry (see geometryScroll): asking each list for its properties
+  // Lists that can be scrolled: where they are and how far they go. The new plugin sends this with the tree.
+  // With the old plugin the position is taken from the geometry (see geometryScroll): asking each list for its properties
   // on every read would run every getter of the list.
   for (const rec of nodes.values()) {
     if ("contentY" in rec.raw && rec.item && shown(rec)) rec.scroll = scrollAxis(rec.raw, "y", rec.rect.h);
@@ -352,6 +386,7 @@ async function interpret(bridge, reply, known, profile, light, settled) {
       const target = shown(rec) ? rec : editor;
       emit(editor, { kind: "input", type: rec.type, objectName: isPartName(rec.objectName) ? "" : rec.objectName, texts: label ? [label] : [], label,
                      value, hidden, length, placeholder, focused: focused.has(editor.id), enabled: editor.enabled && rec.enabled, rect: target.rect, ...place(target) });
+      // The click goes to the editor: it is the editor that must not be under a popup.
       // The other texts inside the wrapper (an error under the field, a counter, the texts of a whole page whose type
       // name looks like a wrapper) are lines of their own. Only what the line of the field already shows is left out.
       childQuiet = rec === editor ? true : { editor, used: new Set([label, placeholder, clean(value)].filter(Boolean)) };
@@ -398,7 +433,7 @@ async function interpret(bridge, reply, known, profile, light, settled) {
   return { window, elements, nodes, modal, key, shown, place };
 }
 
-// `names`: a plugin from 2.0 on reads only these properties. An older plugin reads all of them.
+// `names`: the new plugin reads only these properties. The old plugin reads all of them.
 async function propertiesOf(bridge, objectId, names) {
   const reply = await bridge.send("getProperties", { objectId, names });
   if (reply.error) return null;
@@ -413,7 +448,7 @@ function contentHeight(rec) {
   return !!content && Math.round(content.rect.h - rec.rect.h) >= 20;
 }
 
-// Position and range from the geometry alone, for a plugin before 2.0. Right when the content starts at 0 (originY = 0).
+// Position and range from the geometry alone, for the old plugin. Right when the content starts at 0 (originY = 0).
 // For a list whose content starts elsewhere (a chat that grows upwards), the position can be off; qml_scroll is right for it.
 function geometryScroll(rec) {
   const content = contentItemOf(rec);
@@ -449,6 +484,7 @@ export function formatElement(el) {
   if (!el.enabled) flags.push("disabled");
   if (el.focused) flags.push("focused");
   if (!el.inView) flags.push(el.drawerId ? "in closed drawer" : "not in view");
+  if (el.covered) flags.push("under a popup");
   if (flags.length) line += ` (${flags.join(", ")})`;
   return line;
 }

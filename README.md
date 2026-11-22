@@ -65,11 +65,11 @@ The server listens on `127.0.0.1` only. Every program on the same machine can co
 ```cpp
 auto *inspector = new InspectorServer(mainWindow);
 inspector->setRootObject(mainWindow);
-inspector->setAuthToken(token);   // at least 16 characters; see generic-plugin/README.md
+inspector->setAuthToken(token);   // see generic-plugin/README.md
 inspector->start(3768);
 ```
 
-`attach()` sets no token and reads none from the environment. The generic plugin (`qt-plugin/generic-plugin/`) reads `QML_INSPECTOR_TOKEN`.
+The generic plugin (`qt-plugin/generic-plugin/`) reads the token from `QML_INSPECTOR_TOKEN`. What else holds for the token (its shortest length, what `attach()` does with the variable, how many connections may wait) depends on the plugin: see `qt-plugin/generic-plugin/README.md` of the plugin you build.
 
 ### What it provides
 
@@ -87,9 +87,12 @@ The inspector exposes the full Qt object tree over TCP using a newline-delimited
 
 The object tree includes common identifying properties (`text`, `title`, `source`, `label`, etc.) directly in each node, so consumers don't need extra round-trips to identify elements.
 
-A node also carries the states a client needs to list a screen: `checked`, `activeFocus`, the popup an item belongs to (`popup`, with `modal` and `opened`), and the scroll position of a list (`contentY`, `contentHeight`, `originY`, ...).
+The plugin with the password hiding (a separate change, with its own PR; not in this branch until that PR is merged) adds two things to a node. Its README, `qt-plugin/generic-plugin/README.md`, describes them:
 
-What a password field holds (a text field whose `echoMode` is not `Normal`) is never sent: its node has `"secret": true` and `textLength` in place of `text`. See `qt-plugin/generic-plugin/README.md`.
+- The states a client needs to list a screen: `checked`, `activeFocus`, the popup an item belongs to (`popup`, with `modal` and `opened`), and the scroll position of a list (`contentY`, `contentHeight`, `originY`, ...).
+- What a password field holds (a text field whose `echoMode` is not `Normal`) is left out of what the reading commands send: its node has `"secret": true` and `textLength` in place of `text`.
+
+The MCP server works with both plugins. With the plugin of this branch it asks for the states itself and hides the text of password fields itself.
 
 ## MCP Server
 
@@ -119,6 +122,7 @@ Add to your `.mcp.json`:
 | `QML_INSPECTOR_PORT` | `3768` | Port of the plugin |
 | `QML_INSPECTOR_TOKEN` | not set | The token the app was started with, if it has one |
 | `QML_INSPECTOR_UNLIMITED_TOOLS` | off | `1` adds `qml_evaluate`, `qml_call_method`, `qml_set_property` |
+| `QML_INSPECTOR_FILE_DIALOGS` | off | `1` allows `select` and `accept` of `qml_file_dialog_action` |
 | `QML_INSPECTOR_PROFILE` | not set | App profile, for example `status` |
 | `QML_INSPECTOR_TIMEOUT` | `15000` | Milliseconds to wait for one reply |
 

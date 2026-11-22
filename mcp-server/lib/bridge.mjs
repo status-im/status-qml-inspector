@@ -3,8 +3,13 @@ import net from "node:net";
 
 // One socket with everything that belongs to it: its buffer and the requests that wait for a reply on it.
 // When it closes, only its own requests fail.
+// The longest line the plugin may send. The tree of a large page has about one million characters.
+// A line that passes this is not a reply: the connection is closed, so that the server does not fill its memory.
+export const MAX_LINE_CHARS = 64 * 1024 * 1024;
+export const LOST_CONNECTION = "The connection to the app was lost and opened again during this call";
+
 class Connection {
-  constructor(socket, timeoutMs) {
+  constructor(socket, timeoutMs, maxLineChars = MAX_LINE_CHARS) {
     this.socket = socket;
     this.timeoutMs = timeoutMs;
     this.pending = new Map(); // id -> { resolve, reject, timer }
@@ -16,8 +21,15 @@ class Connection {
     socket.on("data", (text) => {
       this.buffer += text;
       this._processBuffer();
+      // What is left is the start of one line.
+      if (this.buffer.length > maxLineChars) {
+        this.reason = `it sent a line of more than ${maxLineChars} characters`;
+        this._fail(new Error(`The inspector sent a line of more than ${maxLineChars} characters. This is no reply; the connection was closed.`));
+        socket.destroy();
+      }
     });
     socket.on("close", () => {
+      if (this.closed) return;
       // What is left in the buffer can be the last line of the plugin, without a line end.
       if (this.buffer.trim()) this.buffer += "\n";
       this._processBuffer();
@@ -50,10 +62,12 @@ class Connection {
       } catch {
         continue; // not a reply
       }
+      // A reply is one JSON object. Anything else that is valid JSON (null, a number, a list) is skipped.
+      if (!msg || typeof msg !== "object" || Array.isArray(msg)) continue;
       const p = this.pending.get(String(msg.id));
       // A line with an error and no id of a request is the reason the plugin gives before it closes the connection
       // (too many connections, no token in time). It is kept, so that the user sees it.
-      if (!p && msg && typeof msg.error === "string" && (msg.id === undefined || msg.id === null)) this.reason = msg.error.slice(0, 300);
+      if (!p && typeof msg.error === "string" && (msg.id === undefined || msg.id === null)) this.reason = msg.error.slice(0, 300);
       if (!p) continue;
       clearTimeout(p.timer);
       this.pending.delete(String(msg.id));
@@ -82,11 +96,16 @@ export class QtBridge {
   // host: 127.0.0.1 and not "localhost". "localhost" can also mean ::1, where the plugin never listens
   //   and another program may: the token would go to that program.
   // token: the secret the plugin was started with (QML_INSPECTOR_TOKEN). Empty when the plugin has none.
-  constructor({ host = "127.0.0.1", port = 3768, timeoutMs = 15000, token = "" } = {}) {
+  // connectTimeoutMs: how long an attempt to connect may take. A host that drops the packets gives no error at all.
+  constructor({ host = "127.0.0.1", port = 3768, timeoutMs = 15000, token = "", connectTimeoutMs = Math.min(timeoutMs, 10000), maxLineChars = MAX_LINE_CHARS } = {}) {
     this.token = token;
     this.host = host;
     this.port = port;
     this.timeoutMs = timeoutMs;
+    this.connectTimeoutMs = connectTimeoutMs;
+    this.maxLineChars = maxLineChars;
+    this.generation = 0;     // how many connections were opened so far. Object ids of an earlier one may mean other objects now.
+    this.pinned = null;      // when set: send() fails if the connection is not the one with this number (see tools.mjs)
     this.connection = null;  // the open connection, after the token check
     this.connecting = null;  // the one attempt to open it, shared by every caller that waits for it
     this.requestId = 0;
@@ -107,6 +126,7 @@ export class QtBridge {
         .then(async (connection) => {
           if (this.token) await this._authenticate(connection);
           this.connection = connection;
+          this.generation++;
           if (this.onConnect) this.onConnect();
           return connection;
         })
@@ -120,11 +140,18 @@ export class QtBridge {
   _open() {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection({ host: this.host, port: this.port });
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`Cannot connect to the inspector at ${this.host}:${this.port} (no answer in ${this.connectTimeoutMs} ms). ` +
+                         "Make sure the Qt app is running with the inspector plugin loaded."));
+      }, this.connectTimeoutMs);
       socket.once("connect", () => {
+        clearTimeout(timer);
         socket.setNoDelay(true);
-        resolve(new Connection(socket, this.timeoutMs));
+        resolve(new Connection(socket, this.timeoutMs, this.maxLineChars));
       });
       socket.once("error", (err) => {
+        clearTimeout(timer);
         reject(new Error(`Cannot connect to the inspector at ${this.host}:${this.port} (${err.message}). ` +
                          "Make sure the Qt app is running with the inspector plugin loaded."));
       });
@@ -162,6 +189,12 @@ export class QtBridge {
 
   async send(command, params = {}) {
     const connection = await this.connect();
+    // A tool call is made over one connection. If that one closed and a new one was opened, the app may have started
+    // again, and the object ids the call works with may mean other objects: the call must not go on.
+    if (this.pinned !== null && this.generation !== this.pinned) {
+      throw new Error(`${LOST_CONNECTION}. The app may have started again, so the call was stopped: its references may mean other objects now. ` +
+                      "Call qml_snapshot and go on from what it shows.");
+    }
     let reply;
     try {
       reply = await connection.request(++this.requestId, command, params);

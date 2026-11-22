@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { QtBridge } from "./lib/bridge.mjs";
-import { createToolset, INSTRUCTIONS, UNLIMITED_SWITCH } from "./lib/tools.mjs";
+import { createToolset, INSTRUCTIONS, UNLIMITED_SWITCH, FILE_DIALOG_SWITCH } from "./lib/tools.mjs";
 import { loadProfile } from "./lib/profile.mjs";
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ const bridge = new QtBridge({
   timeoutMs: numberFrom("QML_INSPECTOR_TIMEOUT", 15000, 1, 600000),
   token,
 });
-const tools = createToolset({ bridge, profile, unlimitedTools: isOn(process.env[UNLIMITED_SWITCH]) });
+const tools = createToolset({ bridge, profile, unlimitedTools: isOn(process.env[UNLIMITED_SWITCH]), fileDialogs: isOn(process.env[FILE_DIALOG_SWITCH]) });
 
 // ---------------------------------------------------------------------------
 // MCP Server

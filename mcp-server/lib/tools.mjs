@@ -1,7 +1,8 @@
 // The MCP tools. Each tool call becomes one or more commands to the inspector plugin.
 // The tools that act on an object check the object first and reply with what changed on the screen.
-import { readScreen, listedElements, modalLine, formatObject, shortType, scrollAxis, findSecrets, hideSecrets, pluginHidesSecrets } from "./screen.mjs";
+import { readScreen, listedElements, modalLine, formatObject, shortType, scrollAxis, findSecrets, hideSecrets, pluginHidesSecrets, isEchoField } from "./screen.mjs";
 import { GENERIC_PROFILE } from "./profile.mjs";
+import { LOST_CONNECTION } from "./bridge.mjs";
 
 export const MAX_REPLY_CHARS = 8000;
 const NOTE_ROOM = 400; // kept free for the note that says what was cut
@@ -29,7 +30,8 @@ export const TOOLS = [
     name: "qml_snapshot",
     description:
       "START HERE. Lists what is on the screen now as short text: one line per button, input field, switch, list row and text, " +
-      "with a reference like [e12], the visible label, the objectName, the value of text fields, and marks such as (checked), (disabled), (not in view). " +
+      "with a reference like [e12], the visible label, the objectName, the value of text fields, and marks such as (checked), (disabled), (not in view), " +
+      "(under a popup). A label is cut at 80 characters and ends in … then: read the whole text with qml_get_properties {ref, names: [\"text\"]}. " +
       "A password field shows value=(hidden): what it holds is never returned. " +
       "Cheaper and more exact than a screenshot. Use the reference with qml_click and qml_send_keys. " +
       "If a modal popup is open, only the popup is listed. " +
@@ -47,7 +49,7 @@ export const TOOLS = [
     name: "qml_click",
     description:
       "Click one element. Name it with ONE of: ref (from qml_snapshot), objectName, or text (the exact visible label). " +
-      "The element is checked first: no match, more than one match, a hidden or disabled element, or one behind a popup is an error and nothing is clicked. " +
+      "The element is checked first: no match, more than one match, a hidden or disabled element, or one behind or under a popup is an error and nothing is clicked. " +
       "An element that is scrolled out of view is scrolled into view first, and a closed drawer is opened first. " +
       "The reply lists what changed on the screen after the click, so no screenshot is needed to check it. " +
       "Clicking by (x, y) pixel coordinates relative to the main window is also possible, but it is not checked and reports no changes.",
@@ -162,7 +164,8 @@ export const TOOLS = [
   {
     name: "qml_get_properties",
     description:
-      "Get properties of one object, as 'name = value' lines. Pass names to get only those properties; without names the list is long and may be cut. " +
+      "Get properties of one object, as 'name = value' lines. Pass names to get only those properties, each value in full; " +
+      "without names the list is long, and a value over 200 characters is cut. " +
       "details: true adds the type of each property, marks the ones that cannot be written, and lists the methods of the object. " +
       "What a password field holds is shown as (hidden)." + DATA_NOTE,
     inputSchema: {
@@ -255,12 +258,14 @@ export const TOOLS = [
       "listed even while they are not visible/active. " +
       "Workflow note: due to Qt limitations, the file selection often cannot be changed once a " +
       "dialog is active. To select a file, call `qml_file_dialog_action` with action `select` BEFORE " +
-      "performing the step that opens the dialog (e.g. clicking the button that triggers it), not after.",
+      "performing the step that opens the dialog (e.g. clicking the button that triggers it), not after." + DATA_NOTE,
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "qml_file_dialog_action",
-    description: "Interacts with an existing file dialog.",
+    description:
+      "Interacts with an existing file dialog. 'cancel' is always possible. 'select' and 'accept' are off by default (QML_INSPECTOR_FILE_DIALOGS=1): " +
+      "they choose a file of this computer and hand it to the app, and the app can send it to other people.",
     inputSchema: {
       type: "object",
       properties: {
@@ -283,11 +288,16 @@ export const TOOLS = [
 // They are listed and can be called only when the server is started with QML_INSPECTOR_UNLIMITED_TOOLS=1.
 export const UNLIMITED_TOOLS = ["qml_set_property", "qml_call_method", "qml_evaluate"];
 export const UNLIMITED_SWITCH = "QML_INSPECTOR_UNLIMITED_TOOLS";
+// The actions of qml_file_dialog_action that choose a path or hand it to the app. They have a switch of their own:
+// a test that attaches a picture needs them, and should not have to turn on the three tools above for it.
+export const FILE_DIALOG_SWITCH = "QML_INSPECTOR_FILE_DIALOGS";
+const FILE_DIALOG_CHOICES = ["select", "accept"];
 
 // What a client may assume about each tool (MCP tool annotations).
 // openWorldHint: the app is not a closed world. It can be a messenger or a wallet: what is on its screen can be written by
 //   strangers, and a click can send a message or a payment to other people. So every tool that returns text of the app
-//   or sends input to it is marked open-world. Only the two file dialog tools are not: they deal with local files.
+//   or sends input to it is marked open-world. The file dialog tools too: a file that is chosen in a dialog goes to the app,
+//   and the app can send it on.
 // readOnlyHint: the tool sends no input and sets nothing. It still reads properties, and a property getter is code of the app
 //   (see "Every tool says whether it only reads" in the README).
 // destructiveHint: a click or a key press does whatever the app does on that input, deleting included.
@@ -303,12 +313,12 @@ export const ANNOTATIONS = {
   qml_find_by_property: reads("Find objects by property"),
   qml_get_properties: reads("Read properties"),
   qml_get_tree: reads("Read the object tree"),
-  qml_list_file_dialogs: reads("List file dialogs", false),
+  qml_list_file_dialogs: reads("List file dialogs"),
   qml_click: acts("Click an element", true, false),
   qml_find_and_click: acts("Find and click an element", true, false),
   qml_send_keys: acts("Type text or press a key", true, false),
   qml_scroll: acts("Scroll a list", false, true),
-  qml_file_dialog_action: acts("Use a file dialog", true, false, false),
+  qml_file_dialog_action: acts("Use a file dialog", true, false),
   qml_set_property: acts("Set any property (unlimited)", true, true),
   qml_call_method: acts("Call any method (unlimited)", true, false),
   qml_evaluate: acts("Run JavaScript in the app (unlimited)", true, false),
@@ -324,8 +334,9 @@ const FLICK_PROPERTIES = ["contentX", "contentY", "contentWidth", "contentHeight
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ok = (text) => ({ content: [{ type: "text", text }] });
-const fail = (text) => ({ content: [{ type: "text", text: cut(text, "") }], isError: true });
+const fail = (text) => ({ content: [{ type: "text", text }], isError: true });
 const HIDDEN = "(hidden)";
+const LISTED_MAX = 5000; // how many listed lines are remembered for the check of a reference
 // The properties of a text field that hold what was typed.
 const TYPED_TEXT = ["text", "displayText", "selectedText", "preeditText"];
 
@@ -346,6 +357,22 @@ export function cut(text, hint) {
   const more = lines.length - kept.length;
   const note = more > 0 && kept.length >= 2 ? `${more} more line${more === 1 ? "" : "s"} not shown` : `cut: ${text.length - shown.length} more characters not shown`;
   return `${shown}\n… ${note}. ${hint}`.slice(0, MAX_REPLY_CHARS);
+}
+
+// The one place where the size of a reply is kept under the limit, for every tool and for every error:
+// the text blocks of a reply together are never longer than MAX_REPLY_CHARS. A tool that returns JSON has cut it
+// to fit before (see fitted); this is for everything else, such as an error that repeats a long argument.
+export function capped(result) {
+  let room = MAX_REPLY_CHARS;
+  const content = [];
+  for (const block of result.content) {
+    if (block.type !== "text") { content.push(block); continue; }
+    if (room <= 0) continue;
+    const text = block.text.length <= room ? block.text : cut(block.text, "").slice(0, room);
+    room -= text.length;
+    content.push({ ...block, text });
+  }
+  return { ...result, content };
 }
 
 // Checks the arguments of a call against the schema of the tool: known names, types, allowed values, required ones.
@@ -391,12 +418,24 @@ export function validateArguments(tool, given) {
   return args;
 }
 
-// Replaces every text that equals a hidden one, at any depth of a JSON value.
-function deepHide(value, hiddenValues) {
-  if (typeof value === "string") return hiddenValues.has(value) ? HIDDEN : value;
-  if (Array.isArray(value)) return value.map((v) => deepHide(v, hiddenValues));
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, deepHide(v, hiddenValues)]));
+// Replaces every text that equals a hidden one by null, at any depth of a JSON value, as the plugin with the password
+// hiding does. `counter.hidden` counts them, so that the reply can say that a null may be a hidden value.
+function deepHide(value, hiddenValues, counter = {}) {
+  if (typeof value === "string") {
+    if (!hiddenValues.has(value)) return value;
+    counter.hidden = (counter.hidden || 0) + 1;
+    return null;
+  }
+  if (Array.isArray(value)) return value.map((v) => deepHide(v, hiddenValues, counter));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, deepHide(v, hiddenValues, counter)]));
   return value;
+}
+const hiddenNote = (n) => (n > 0 ? `${n} value${n === 1 ? " is" : "s are"} hidden: ${n === 1 ? "it equals" : "they equal"} what a password field holds. Inside a list such a value shows as null.` : "");
+// Takes every hidden text out of a text that is not a value of the app (an error text made by a script).
+function maskText(text, hiddenValues) {
+  let out = String(text);
+  for (const value of [...hiddenValues].sort((a, b) => b.length - a.length)) out = out.split(value).join(HIDDEN);
+  return out;
 }
 
 // A copy of a tree node with its children only down to `depth`. A node that lost children keeps their number in childCount.
@@ -408,16 +447,56 @@ function pruned(node, depth) {
 }
 const depthOf = (node) => (node && Array.isArray(node.children) && node.children.length ? 1 + Math.max(...node.children.map(depthOf)) : 0);
 
-export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs = 3000, maxWaitMs = 30000, unlimitedTools = false, profile = GENERIC_PROFILE } = {}) {
+export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs = 3000, maxWaitMs = 30000, unlimitedTools = false, fileDialogs = false, listedMax = LISTED_MAX,
+                                profile = GENERIC_PROFILE } = {}) {
   const drawers = new Map(); // object id -> is it a drawer; see readScreen
-  let hides = null;          // does the plugin hide what password fields hold: true, false (a plugin before 2.0), null = not known yet
+  let hides = null;          // does the plugin hide what password fields hold: true, false (a plugin without the hiding), null = not known yet
   let stopping = false;      // the server is ending: calls that run are finished, no new one starts
   const running = new Set();
+  let active = 0;            // calls that run now
+  let refsFrom = 0;          // the number of the connection whose references the user has seen last
+  const listed = new Map();  // object id -> how the element was listed last: { same, line }
   // After a new connection the app may have started again: its object ids start again too, and it can have another plugin.
   bridge.onConnect = () => {
     drawers.clear();
+    listed.clear();
     hides = null;
   };
+
+  // A reference is an object id, and an id means an object only on the connection it came from. Every call is made
+  // over one connection (bridge.pinned). A call that names its target by a reference is refused when the connection
+  // is not the one whose references the user has seen: after a new connection the same id can be another object.
+  async function begin(args) {
+    if (++active === 1) bridge.pinned = null;
+    await bridge.connect();
+    if (bridge.pinned === null) bridge.pinned = bridge.generation;
+    if (idOf(args) !== null && bridge.generation > 1 && refsFrom !== bridge.generation) {
+      throw new ToolError("This is a new connection to the app: the app may have started again, and a reference from before can mean another object now. " +
+                          "Nothing was done. Call qml_snapshot for the current references.");
+    }
+  }
+  function end() {
+    if (--active === 0) bridge.pinned = null;
+  }
+
+  // What the user was shown for a reference. When the element behind a reference has another type, name or label
+  // than it had when it was listed (a list reuses a row for another entry), the user would act on something
+  // they have not seen: the call is refused once, with both lines.
+  const sameAs = (el) => JSON.stringify([el.type, el.objectName, el.label, el.kind]);
+  function remember(elements) {
+    for (const el of elements) listed.set(el.id, { same: sameAs(el), line: el.line });
+    // Kept small in a long session: the lines that were listed longest ago go first.
+    while (listed.size > listedMax) listed.delete(listed.keys().next().value);
+  }
+  function checkListed(el) {
+    const was = listed.get(el.id);
+    listed.set(el.id, { same: sameAs(el), line: el.line });
+    if (was && was.same !== sameAs(el)) {
+      throw new ToolError(`[e${el.id}] was listed as:\n${was.line}\nIt is now:\n${el.line}\nThe screen has changed since you saw that reference, so nothing was done. ` +
+                          "If the new line is the one you mean, use the reference again.");
+    }
+    return el;
+  }
   const read = (options = {}) => readScreen(bridge, drawers, { profile, ...options });
   const send = async (command, params = {}) => {
     const reply = await bridge.send(command, params);
@@ -440,12 +519,12 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     }
   }
 
-  // For the replies that hold values of the app. A plugin before 2.0 does not hide what password fields hold:
+  // For the replies that hold values of the app. The old plugin does not hide what password fields hold:
   // -> the fields and their texts for such a plugin, null for a plugin that hides them itself.
   const sameSecrets = (a, b) => a.ids.size === b.ids.size && a.values.size === b.values.size && [...a.ids].every((id) => b.ids.has(id)) && [...a.values].every((v) => b.values.has(v));
 
   // Makes one reading request and says what must be hidden in its reply. -> { reply, secrets } (secrets: null when the plugin hides them itself).
-  // A plugin before 2.0: the search for the password fields is a request of its own. The user can type between it and the read,
+  // The old plugin: the search for the password fields is a request of its own. The user can type between it and the read,
   // and a copy of the text in the reply (a wrapper repeats the text of its field) would then not equal the text that was found.
   // So the fields are searched before and after the read. If the two searches differ, the read is made again;
   // if they keep differing, nothing is shown.
@@ -468,7 +547,16 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   async function actHidden(act) {
     // Also when the plugin is not known yet: the request itself can change what the fields hold.
     const before = hides === true ? null : await findSecrets(bridge);
-    const reply = await act();
+    let reply;
+    try {
+      reply = await act();
+    } catch (err) {
+      // The error text of a script can hold anything the script put into it. A plugin with the password hiding
+      // has taken the texts out; for another plugin they are taken out here.
+      if (!(err instanceof ToolError) || !before) throw err;
+      const after = await findSecrets(bridge);
+      throw new ToolError(maskText(err.message, new Set([...before.values, ...after.values])));
+    }
     hides = pluginHidesSecrets(reply);
     if (hides) return { reply, secrets: null };
     const secrets = await findSecrets(bridge);
@@ -481,6 +569,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     const head = [];
     if (screen.window) head.push(`Window ${JSON.stringify(screen.window.title)} ${screen.window.w}x${screen.window.h}, ${list.length} element${list.length === 1 ? "" : "s"}${options.filter ? ` with ${JSON.stringify(options.filter)}` : ""}.`);
     if (screen.modal) head.push(modalLine(screen));
+    remember(list);
     return cut([...head, ...list.map((e) => e.line)].join("\n"),
                'Narrow it: qml_snapshot {filter: "word"} lists only the lines that contain the word.');
   }
@@ -489,6 +578,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   function changes(before, after) {
     const old = new Map(listedElements(before).map((e) => [e.ref, e.line]));
     const now = listedElements(after);
+    remember(now);
     const lines = [];
     if (modalLine(before) !== modalLine(after)) lines.push(modalLine(after) || "The modal popup is closed.");
     for (const e of now) {
@@ -527,7 +617,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     if (ways !== 1) throw new ToolError("Name the target with exactly one of: ref, objectName, text.");
     if (id !== null) {
       const el = screen.elements.find((e) => e.id === id);
-      if (el) return el;
+      if (el) return checkListed(el);
       const rec = screen.nodes.get(id);
       if (!rec) throw new ToolError(`[e${id}] no longer exists: the screen has changed. Call qml_snapshot for the current references.`);
       if (!rec.item) throw new ToolError(`[e${id}] ${rec.type} is not a visual element.`);
@@ -580,8 +670,22 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     if (el.behindModal) throw new ToolError(`${el.line} is behind a modal popup and cannot be used. ${modalLine(screen)}`);
     if (el.visible === false) throw new ToolError(`${el.line} is not visible.`);
     if (!el.enabled) throw new ToolError(`${el.line} is disabled. Nothing was done.`);
-    if (el.inView) return { screen, el, note: "" };
     const fresh = (after) => after.elements.find((e) => e.id === el.id) || (after.nodes.get(el.id) && after.nodes.get(el.id).item ? pseudo(after, after.nodes.get(el.id)) : null);
+    // An element under an open popup: a click there would go to the popup. The mouse is moved to the element first,
+    // as the hand of a user is: a tooltip of another control goes away then. A popup that stays is an error.
+    const uncovered = async (state) => {
+      if (!state.el.covered) return state;
+      await send("mouse", { objectId: state.el.id, action: "move" });
+      const after = await settled();
+      const again = fresh(after);
+      if (!again || !again.inView) throw new ToolError(`${el.line} is no longer in view. Nothing was clicked. Call qml_snapshot to see what is on the screen.`);
+      if (again.covered) {
+        throw new ToolError(`${el.line} is under an open popup: ${again.coveredBy}. A click there would go to the popup. Nothing was clicked. ` +
+                            "Click an element of the popup, or close the popup first (the key Escape closes most popups).");
+      }
+      return { ...state, screen: after, el: again };
+    };
+    if (el.inView) return uncovered({ screen, el, note: "" });
     if (el.drawerId) {
       await send("callMethod", { objectId: el.drawerId, method: "open", args: [] });
       const after = await settled();
@@ -590,7 +694,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       // In a closed Qt Quick Drawer every item reports "not visible", so an item that the app hides cannot be told from the others
       // until the drawer is open.
       if (again.visible === false) throw new ToolError(`${el.line} is not visible in the open drawer [e${el.drawerId}]: the app hides it. Nothing was clicked. The drawer is open now.`);
-      return { screen: after, el: again, note: " (opened the drawer first)", drawer: true };
+      return uncovered({ screen: after, el: again, note: " (opened the drawer first)", drawer: true });
     }
     if (!el.flick || !el.reachable) {
       throw new ToolError(`${el.line} is outside the window. Nothing was done. It is on a page that is not shown now: open that page first.`);
@@ -607,20 +711,24 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     const after = await settled();
     const again = fresh(after);
     if (!again || !again.inView) throw new ToolError(`${el.line} could not be scrolled into view. Nothing was clicked.`);
-    return { screen: after, el: again, note: " (scrolled into view first)" };
+    return uncovered({ screen: after, el: again, note: " (scrolled into view first)" });
   }
 
   // Press and release as two steps, and look in between whether the element took the press.
   // -> false when another item took it (the release then goes to that item).
   async function pressChecked(id) {
-    await send("mouse", { objectId: id, action: "press" });
-    // The release follows in every case: a mouse button that stays down blocks the app for the user.
+    // The release follows in every case, also when the press got no reply in time (the app may have taken it all the same):
+    // a mouse button that stays down blocks the app for the user.
     let props = {};
     try {
+      await send("mouse", { objectId: id, action: "press" });
       props = await properties(id, ["pressed"]);
-    } finally {
-      await send("mouse", { objectId: id, action: "release" });
+    } catch (err) {
+      // The error of the press or of the check is the one the user must see, not one of the release.
+      await send("mouse", { objectId: id, action: "release" }).catch(() => {});
+      throw err;
     }
+    await send("mouse", { objectId: id, action: "release" });
     return props.pressed !== false;
   }
 
@@ -631,7 +739,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     return value;
   }
 
-  // names: a plugin from 2.0 on reads only these properties; an older plugin reads all of them.
+  // names: the new plugin reads only these properties; the old plugin reads all of them.
   async function properties(objectId, names) {
     const reply = await send("getProperties", names ? { objectId, names } : { objectId });
     const out = {};
@@ -649,6 +757,8 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     const visible = matches.filter((m) => m.visible !== false);
     const pick = visible.length ? visible : matches;
     if (!pick.length) throw new ToolError(`No object with objectName "${args.objectName}".`);
+    // The lines of the matches show their labels. A plugin without the password hiding has sent the text of password fields with them.
+    if (pick.length > 1 && !pluginHidesSecrets(reply)) hideSecrets({ children: pick }, await findSecrets(bridge));
     if (pick.length > 1) throw new ToolError(`${pick.length} objects have the objectName "${args.objectName}". Use the ref of one:\n${pick.slice(0, 8).map((m) => formatObject(m)).join("\n")}`);
     return String(pick[0].id);
   }
@@ -703,7 +813,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
         if (args.text) await send("sendKeys", { text: args.text });
         if (args.key) await send("sendKeys", { key: args.key });
         // The typed text is not repeated: the element that has the focus can be a password field.
-        const sent = [args.text ? `${[...args.text].length} character${[...args.text].length === 1 ? "" : "s"}` : "", args.key ? "the key " + args.key : ""].filter(Boolean).join(" and ");
+        const sent = [args.text ? `${args.text.length} character${args.text.length === 1 ? "" : "s"}` : "", args.key ? "the key " + args.key : ""].filter(Boolean).join(" and ");
         return ok(cut(`Sent ${sent} to the element that has the focus.\n${changes(before, await settled())}`, ""));
       }
       const first = await settled();
@@ -731,7 +841,8 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       if (!now) return ok(cut(`Typed into ${name}. The field is no longer on the screen.\n${report}`, ""));
       if (now.hidden || state.el.hidden) {
         // A password field: only the number of characters can be checked, and the value is not repeated.
-        const expected = args.clear ? [...typed].length : (state.el.length || 0) + [...typed].length;
+        // The number is counted as the plugin and Qt count it: in UTF-16 units, so a character outside the basic plane is two.
+        const expected = args.clear ? typed.length : (state.el.length || 0) + typed.length;
         const holds = args.text ? now.length === expected : !args.clear || now.length === 0;
         if (!holds && !args.key) return fail(`The field holds ${now.length} hidden characters after typing, not ${expected}.\n${now.line}`);
         return ok(cut(`Typed into ${name}. It hides its value; it now holds ${now.length} character${now.length === 1 ? "" : "s"}.\n${report}`, ""));
@@ -759,7 +870,10 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
         const found = pool.filter((e) => (args.objectName ? e.objectName === args.objectName
           : [e.label, ...e.texts, e.value || ""].some((t) => t.toLowerCase().includes(args.text.toLowerCase()))));
         if (gone && !found.length) return ok(`No element with ${what} is on the screen now.`);
-        if (!gone && found.length) return ok(cut(`On the screen:\n${found.slice(0, 5).map((e) => e.line).join("\n")}`, ""));
+        if (!gone && found.length) {
+          remember(found.slice(0, 5));
+          return ok(cut(`On the screen:\n${found.slice(0, 5).map((e) => e.line).join("\n")}`, ""));
+        }
         if (Date.now() >= end) {
           throw new ToolError(gone ? `An element with ${what} is still on the screen after ${timeout} ms:\n${found.slice(0, 3).map((e) => e.line).join("\n")}`
             : `No element with ${what} appeared after ${timeout} ms. Call qml_snapshot to see what is on the screen.`);
@@ -788,19 +902,31 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     async qml_get_properties(args) {
       const id = await objectId(args);
       const wanted = Array.isArray(args.names) && args.names.length ? args.names : null;
-      // With names and no details, only those properties are read (a plugin from 2.0 on).
+      // With names and no details, only those properties are read (a plugin that knows "names").
       const { reply, secrets } = await readHidden(() => send("getProperties", wanted && !args.details ? { objectId: id, names: wanted } : { objectId: id }));
       const all = reply.properties || [];
-      if (secrets) {
-        for (const p of all) {
-          if ((secrets.ids.has(id) && TYPED_TEXT.includes(p.name)) || (typeof p.value === "string" && p.value && secrets.values.has(p.value))) Object.assign(p, { value: null, hidden: true });
-          else p.value = deepHide(p.value, secrets.values);
-        }
-      }
       const list = wanted ? all.filter((p) => wanted.includes(p.name)) : all;
+      // How many values are hidden in what is shown. The plugin with the password hiding gives the number for its whole reply.
+      const counter = { hidden: 0 };
+      if (secrets) {
+        for (const p of list) {
+          if ((secrets.ids.has(id) && TYPED_TEXT.includes(p.name)) || (typeof p.value === "string" && p.value && secrets.values.has(p.value))) {
+            Object.assign(p, { value: null, hidden: true });
+            counter.hidden++;
+          } else {
+            p.value = deepHide(p.value, secrets.values, counter);
+          }
+        }
+      } else if (wanted && !args.details) {
+        counter.hidden = Number(reply.hiddenCount) || 0;
+      } else {
+        counter.hidden = list.filter((p) => p.hidden).length;
+      }
       const lines = list.map((p) => {
         const json = JSON.stringify(p.value) ?? "null";
-        const value = p.hidden ? HIDDEN : json.length > 200 ? json.slice(0, 200) + "…" : json;
+        // A property that was asked for by name is shown whole (the reply as a whole has its limit). In the list of all
+        // properties a long value is cut.
+        const value = p.hidden ? HIDDEN : !wanted && json.length > 200 ? json.slice(0, 200) + "…" : json;
         if (!args.details) return `${p.name} = ${value}`;
         return `${p.name}: ${p.type || "?"} = ${value}${p.writable === false ? " (read-only)" : ""}`;
       });
@@ -811,6 +937,7 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
         lines.push(`Methods: ${methods.length}`);
         for (const m of methods) lines.push(`${m.kind || "method"} ${m.signature || m.name}${m.returnType && m.returnType !== "void" ? ` -> ${m.returnType}` : ""}`);
       }
+      if (counter.hidden) lines.push(hiddenNote(counter.hidden));
       return ok(cut([`[e${id}] ${shortType(reply.type || "")}${wanted ? "" : `: ${all.length} properties`}`, ...lines].join("\n"),
                     "Pass names: [...] to get only the properties you need."));
     },
@@ -841,12 +968,16 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       const id = await objectId(args);
       const before = await settled();
       const { reply, secrets } = await actHidden(() => send("callMethod", { objectId: id, method: args.method, args: args.args || [] }));
-      if (secrets) reply.result = deepHide(reply.result, secrets.values);
-      return ok(cut(`Called ${args.method} on [e${id}]. Result: ${JSON.stringify(reply.result ?? null)}\n${changes(before, await settled())}`, ""));
+      const counter = { hidden: Number(reply.hiddenCount) || 0 };
+      if (secrets) reply.result = deepHide(reply.result, secrets.values, counter);
+      return ok(cut(`Called ${args.method} on [e${id}]. Result: ${JSON.stringify(reply.result ?? null)}${counter.hidden ? "\n" + hiddenNote(counter.hidden) : ""}\n${changes(before, await settled())}`, ""));
     },
     async qml_evaluate(args) {
       const { reply: raw, secrets } = await actHidden(() => send("evaluate", withId(args)));
-      const reply = secrets ? deepHide(raw, secrets.values) : raw;
+      const counter = { hidden: 0 };
+      const reply = secrets ? deepHide(raw, secrets.values, counter) : raw;
+      // The same field as the plugin with the password hiding sends: a null in the result may be a hidden value.
+      if (counter.hidden) reply.hiddenCount = counter.hidden;
       const text = JSON.stringify(reply, null, 2);
       if (text.length <= MAX_REPLY_CHARS) return ok(text);
       return fail(`The expression was evaluated, but its result has ${text.length} characters and the limit is ${MAX_REPLY_CHARS}. ` +
@@ -866,6 +997,10 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
                     "the list of dialogs", "A dialog with childCount above 0 and no \"children\" was cut there: read it with qml_get_tree {objectId}.");
     },
     async qml_file_dialog_action(args) {
+      if (!fileDialogs && FILE_DIALOG_CHOICES.includes(args.action)) {
+        throw new ToolError(`The action "${args.action}" of qml_file_dialog_action is off. It chooses a file of this computer and hands it to the app, ` +
+                            `so the server offers it only when it is started with ${FILE_DIALOG_SWITCH}=1. Nothing was done. "cancel" is always possible.`);
+      }
       return small(await send("fileDialogAction", withId(args)));
     },
   };
@@ -881,17 +1016,23 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
   async function matchLines(request, none, hint, { property = "", byValue = false, showValue = false }) {
     const { reply, secrets } = await readHidden(request);
     let matches = reply.matches || [];
+    let hiddenShown = secrets ? 0 : Number(reply.hiddenCount) || 0;
     if (secrets) {
+      // A field that the search for password fields did not see at all is taken as one (see hideSecrets).
+      const isSecretField = (m) => secrets.ids.has(String(m.id)) || (isEchoField(m) && !secrets.shown.has(String(m.id)));
       for (const m of matches) {
-        if ((secrets.ids.has(String(m.id)) && TYPED_TEXT.includes(property)) || (typeof m.value === "string" && m.value && secrets.values.has(m.value))) {
+        if ((isSecretField(m) && TYPED_TEXT.includes(property)) || (typeof m.value === "string" && m.value && secrets.values.has(m.value))) {
           m.hidden = true;
+          hiddenShown++;
         } else {
           // A list or a map that holds the text of a password field: the text is replaced inside it.
-          const shown = deepHide(m.value, secrets.values);
-          if (JSON.stringify(shown) !== JSON.stringify(m.value)) Object.assign(m, { value: shown, holdsHidden: true });
+          const counter = {};
+          const shown = deepHide(m.value, secrets.values, counter);
+          if (counter.hidden) Object.assign(m, { value: shown, holdsHidden: true });
+          hiddenShown += counter.hidden || 0;
         }
-        hideSecrets(m, secrets);
       }
+      for (const m of matches) hideSecrets(m, secrets);
       // A search for the value of a password field must not say that the value is right.
       if (byValue) matches = matches.filter((m) => !m.hidden && !m.holdsHidden);
     }
@@ -901,8 +1042,18 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
       const rec = screen.nodes.get(String(m.id));
       return !!rec && screen.shown(rec) && !screen.place(rec).inView;
     };
-    const valueOf = (m) => (m.hidden ? HIDDEN : String(JSON.stringify(m.value) ?? "").slice(0, 60));
+    // A long value is cut so that it stays one JSON value: a text keeps its closing quote.
+    const valueOf = (m) => {
+      if (m.hidden) return HIDDEN;
+      if (typeof m.value === "string") return JSON.stringify(m.value.length > 60 ? m.value.slice(0, 59) + "…" : m.value);
+      const json = String(JSON.stringify(m.value) ?? "null");
+      return json.length > 60 ? json.slice(0, 59) + "…" : json;
+    };
     const lines = matches.map((m) => formatObject(m, showValue ? `${property}=${valueOf(m)}` : "", offScreen(m) ? ["not on screen"] : []));
+    // When values are shown: how many of them are hidden (a null inside a list may be one).
+    // In a search by value nothing is said: with a plugin that sends the text of password fields, the number of
+    // objects that were left out would tell whether the value is right.
+    if (showValue && hiddenShown) lines.push(hiddenNote(hiddenShown));
     return ok(cut([`${matches.length} object${matches.length === 1 ? "" : "s"}:`, ...lines].join("\n"), hint));
   }
 
@@ -943,19 +1094,30 @@ export function createToolset({ bridge, settleIntervalMs = 150, settleTimeoutMs 
     async call(name, args) {
       const handler = Object.hasOwn(handlers, name) ? handlers[name] : null;
       const tool = TOOLS.find((t) => t.name === name);
-      if (!handler || !tool) return fail(`Unknown tool: ${name}`);
+      if (!handler || !tool) return capped(fail(`Unknown tool: ${String(name).slice(0, 100)}`));
       if (!unlimitedTools && UNLIMITED_TOOLS.includes(name)) {
         return fail(`${name} is off. It can change anything in the app, so the server offers it only when it is started with ${UNLIMITED_SWITCH}=1. Nothing was done.`);
       }
       if (stopping) return fail("The server is stopping. Nothing was done.");
       const run = (async () => {
+        let begun = false;
         try {
-          return await handler(validateArguments(tool, args));
+          const valid = validateArguments(tool, args);
+          begun = true;
+          await begin(valid);
+          const result = await handler(valid);
+          // A call that got this far did not start from a reference of another connection (begin refuses that).
+          // Its reply shows the screen of this connection, with its references: they are good from now on.
+          if (!result.isError) refsFrom = bridge.generation;
+          return result;
         } catch (err) {
           if (err instanceof ToolError) return fail(err.message);
-          return fail(/^Cannot connect|^Qt Inspector error/.test(err.message) ? err.message : `Connection error: ${err.message}`);
+          const known = err.message.startsWith(LOST_CONNECTION) || /^Cannot connect|^Qt Inspector error/.test(err.message);
+          return fail(known ? err.message : `Connection error: ${err.message}`);
+        } finally {
+          if (begun) end();
         }
-      })();
+      })().then(capped);
       running.add(run);
       try {
         return await run;

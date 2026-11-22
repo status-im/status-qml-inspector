@@ -234,9 +234,9 @@ test("every tool has a title and complete hints; destructive and open-world are 
   for (const name of ["qml_snapshot", "qml_list_interactive", "qml_screenshot", "qml_wait_for", "qml_find_by_type", "qml_find_by_property", "qml_get_properties", "qml_get_tree", "qml_scroll"]) {
     assert.equal(by[name].openWorldHint, true, name);
   }
-  // File dialogs are about local files.
-  assert.equal(by.qml_list_file_dialogs.openWorldHint, false);
-  assert.equal(by.qml_file_dialog_action.openWorldHint, false);
+  // A file that is chosen in a dialog goes to the app, and the app can send it on.
+  assert.equal(by.qml_list_file_dialogs.openWorldHint, true);
+  assert.equal(by.qml_file_dialog_action.openWorldHint, true);
   assert.equal(by.qml_file_dialog_action.destructiveHint, true);
   assert.equal(by.qml_scroll.destructiveHint, false);
   assert.equal(by.qml_scroll.idempotentHint, true);
@@ -250,7 +250,7 @@ test("index.mjs sends the annotations to the client", async () => {
     assert.equal(by.qml_click.readOnlyHint, false);
     assert.equal(by.qml_click.destructiveHint, true);
     assert.equal(by.qml_click.openWorldHint, true);
-    assert.equal(by.qml_list_file_dialogs.openWorldHint, false);
+    assert.equal(by.qml_list_file_dialogs.openWorldHint, true);
     for (const t of tools) assert.equal(t.inputSchema.additionalProperties, false, t.name);
   });
 });
