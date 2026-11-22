@@ -11,9 +11,10 @@
 #include <QSet>
 #include <QByteArray>
 #include <QHash>
-#include <QElapsedTimer>
 
 #include <functional>
+
+#include "tokenrule.h"
 
 class QTcpServer;
 class QTcpSocket;
@@ -41,6 +42,8 @@ public:
     /// {"command": "auth", "params": {"token": "..."}}. A connection that sends
     /// anything else first, or a wrong token, gets one error line and is closed.
     /// Empty (the default) means no check. Set it before start().
+    /// The token goes over the local socket as it is. It keeps out programs that do not know it; it is no protection
+    /// against a program that listens on the port before the app does (that program gets the token of a client).
     void setAuthToken(const QByteArray &token);
     /// Why a value cannot be used as a token (too short), or an empty string when it can.
     static QString tokenProblem(const QByteArray &token);
@@ -56,13 +59,22 @@ public:
     /// With a token: at most this many connections that have not sent it yet.
     static constexpr int kMaxWaiting = 8;
     /// The shortest token that start() accepts.
-    static constexpr int kMinTokenLength = 16;
+    static constexpr int kMinTokenLength = InspectorToken::kMinLength;
 
     /// One-liner: attach to a root and start on the given port.
     /// root may be a QWidget, a QWindow, any QObject, or nullptr (see setRootObject).
     /// If port == 0, reads QML_INSPECTOR_PORT env var (default 3768).
-    /// No token: an app that wants one calls setAuthToken() and start() itself.
+    /// Token: when QML_INSPECTOR_TOKEN is set, its value (without spaces around it) is the token, by the same rule
+    /// as in the generic plugin. A value that is set but empty or too short is not "no token": the server is then
+    /// not started (port() is 0) and one warning is logged. When the variable is not set there is no token and
+    /// nothing is logged about it. An app that wants another source for the token calls setAuthToken() and start().
     static InspectorServer* attach(QObject *root, int port = 0);
+
+    /// For tests and measurements: the connections that are open now, the bytes that connections without the token
+    /// have sent and that wait for their line end, and how often the tree was walked for the texts of password fields.
+    int connectionCount() const { return m_clients.size(); }
+    int bytesWaiting() const;
+    int secretLookups() const { return m_secretLookups; }
 
     /// Runs one request ({"id", "command", "params"}) and returns its reply.
     /// Public for the relay client, which serves commands without a socket.
@@ -98,11 +110,15 @@ private:
     QJsonArray serializeProperties(QObject *obj);
     QJsonValue variantToJson(const QVariant &var);
 
-    // Hidden text: what a password field holds is never sent to a client.
+    // Hidden text: what a password field holds is left out of what the reading commands send (see the README
+    // for what a client that may change the app can still do).
     void collectSecrets();
     const QSet<QString> &secrets();
     bool isSecretValue(const QVariant &value);
     bool holdsSecret(const QVariant &value);
+    /// Counts one hidden value for the reply of this command, and returns null: the one form of a hidden value.
+    QJsonValue hiddenValue();
+    QString withoutSecrets(QString text);
 
     // Object registry
     QString registerObject(QObject *obj);
@@ -129,7 +145,9 @@ private:
     void sendResponse(QTcpSocket *socket, const QJsonObject &response);
     void refuse(QTcpSocket *socket, int id, const QString &message);
     void readFrom(QTcpSocket *socket);
-    void drop(QTcpSocket *socket, const QString &reason);
+    void drop(QTcpSocket *socket, const QString &reason, int id = -1);
+    void dropForRoom(QTcpSocket *socket, const QString &reason);
+    void forget(QTcpSocket *socket);
     int waitingCount() const;
     QTcpSocket *longestIdle(bool mayCommand) const;
 
@@ -141,8 +159,13 @@ private:
     int m_authTimeoutMs = 5000;
     QSet<QString> m_secrets;
     bool m_secretsCollected = false;
-    QHash<QTcpSocket*, qint64> m_lastActive;   // when each connection last sent something
-    QElapsedTimer m_clock;
+    int m_secretLookups = 0;
+    int m_hiddenCount = 0;      // values hidden in the reply of the command that runs
+    bool m_plainValues = false; // variantToJson: no hiding (only to compare a value with what the client sent)
+    // The order in which the connections last sent something: a larger number is more recent.
+    // A counter and not a clock, so that two connections never have the same value.
+    QHash<QTcpSocket*, quint64> m_lastActive;
+    quint64 m_tick = 0;
 
     QPointer<QObject> m_root;
 

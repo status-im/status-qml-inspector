@@ -26,6 +26,8 @@ target_sources(qmlinspector PRIVATE
     relayclient.cpp
     relayurl.h
     envswitch.h
+    startplan.h
+    ../tokenrule.h
     qmlinspectorplugin.cpp
     qmlinspector.json
 )

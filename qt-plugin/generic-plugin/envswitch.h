@@ -4,8 +4,8 @@
 #include <QByteArray>
 
 // A switch from the environment is on with 1, true, yes or on (any case, spaces around it do not count).
-// Every other value, and no value, is off. The MCP server reads its switches by the same rule (index.mjs, isOn),
-// so a value that one side does not know never turns something on.
+// Every other value, and no value, is off: a value that is not known never turns something on.
+// A client of the plugin that has switches of its own should read them by the same rule.
 inline bool switchIsOn(const QByteArray &raw)
 {
     const QByteArray value = raw.trimmed().toLower();

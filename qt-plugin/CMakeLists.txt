@@ -5,6 +5,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets Quick QuickWidgets Qml
 add_library(qml-inspector STATIC
     inspectorserver.h
     inspectorserver.cpp
+    tokenrule.h
 )
 
 target_include_directories(qml-inspector PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

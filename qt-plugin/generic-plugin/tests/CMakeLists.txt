@@ -23,6 +23,12 @@ target_include_directories(tst_envswitch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(tst_envswitch PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME tst_envswitch COMMAND tst_envswitch)
 
+# tst_startplan: what the plugin does when it is created (off, listen, relay), from the environment alone.
+add_executable(tst_startplan tst_startplan.cpp)
+target_include_directories(tst_startplan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+target_link_libraries(tst_startplan PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME tst_startplan COMMAND tst_startplan)
+
 if(TARGET Qt6::Gui AND TARGET Qt6::Qml AND TARGET Qt6::Quick AND TARGET Qt6::Widgets)
     # tst_authtoken: the token check, with the real server on a local socket.
     # tst_secrets: the text of password fields is in no reply.
