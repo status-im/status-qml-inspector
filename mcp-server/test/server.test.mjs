@@ -24,7 +24,7 @@ test("index.mjs serves the tools over stdio and talks to the inspector", async (
     const { tools } = await client.listTools();
     assert.ok(tools.some((t) => t.name === "qml_snapshot"));
     const snap = await client.callTool({ name: "qml_snapshot", arguments: {} });
-    assert.match(snap.content[0].text, /\[e\d+\] Button "OK" objectName=okButton/);
+    assert.match(snap.content[0].text, /\[e\d+\] Button "OK" objectName=\"okButton\"/);
     const miss = await client.callTool({ name: "qml_click", arguments: { text: "Cancel" } });
     assert.equal(miss.isError, true);
     const hit = await client.callTool({ name: "qml_click", arguments: { text: "OK" } });

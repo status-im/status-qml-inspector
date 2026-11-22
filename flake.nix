@@ -19,9 +19,9 @@
           # MCP server built with npm dependencies
           mcpServer = pkgs.buildNpmPackage {
             pname = "qml-mcp-server";
-            version = "1.0.0";
+            version = "2.0.0";
             src = ./mcp-server;
-            npmDepsHash = "sha256-rDGJIt6PyXuQjO+/GsVBrTbDUIZhEeDUlOQfH8tUojM=";
+            npmDepsHash = "sha256-lrlOgVyDYKv+hBg/1jOfPm/fNn94qR9CnxYcnXFuIYw=";
             dontNpmBuild = true;
             installPhase = ''
               mkdir -p $out/lib

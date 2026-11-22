@@ -1,5 +1,11 @@
 // A stand-in for the inspector plugin: the same JSON-lines protocol on a local socket,
 // served from a small object tree that the test builds. No Qt and no app are needed.
+//
+// It can stand in for two plugins (fake.plugin):
+//   "old": the plugin before version 2.0, as in the test builds of the app so far. Its tree has no states,
+//          and it sends the text of password fields.
+//   "new": the plugin from 2.0 on. Its tree carries the states (checked, activeFocus, popup, scroll position),
+//          and it leaves out what password fields hold (see qt-plugin/inspectorserver.cpp).
 import net from "node:net";
 
 let nextId = 1;
@@ -7,8 +13,8 @@ let nextId = 1;
 // node("StatusButton", { objectName: "btnSave", text: "Save", w: 80, h: 30 }, [children])
 export function node(type, opts = {}, children = []) {
   const { inherits = [], objectName = "", visible = true, enabled = true, x = 0, y = 0, w = 100, h = 20,
-          props = {}, onClick = null, methods = {}, ...identifying } = opts;
-  const n = { id: String(nextId++), type, inherits, objectName, visible, enabled, x, y, w, h,
+          props = {}, onClick = null, methods = {}, id = null, ...identifying } = opts;
+  const n = { id: id === null ? String(nextId++) : String(id), type, inherits, objectName, visible, enabled, x, y, w, h,
               props: { ...props }, onClick, methods, identifying, children: [], parent: null };
   for (const c of children) add(n, c);
   return n;
@@ -21,7 +27,11 @@ export function add(parent, child) {
 }
 
 const isWindow = (n) => n.type.includes("Window");
-const isItem = (n) => !isWindow(n) && !n.inherits.includes("QQuickPopup") && n.type !== "QGuiApplication";
+const isPopup = (n) => n.inherits.includes("QQuickPopup");
+const isItem = (n) => !isWindow(n) && !isPopup(n) && n.type !== "QGuiApplication";
+const isEchoField = (n) => n.inherits.includes("QQuickTextInput") || n.inherits.includes("QLineEdit");
+const hidesText = (n) => isEchoField(n) && !!n.props.echoMode;
+const TYPED_TEXT = ["text", "displayText", "selectedText", "preeditText"];
 
 export class FakeInspector {
   constructor(root) {
@@ -34,9 +44,15 @@ export class FakeInspector {
     this.delayMs = 0;
     this.stealPresses = 0;    // this many of the next mouse presses go to another item, as when an overlay takes the tap
     this.onStolenClick = null;
+    this.plugin = "old";      // "old" or "new", see the top of this file
+    this.connections = 0;     // sockets accepted so far
+    this.requests = [];       // every request line received, the token check included
+    this.splitCharacters = false; // when set, a reply is written in pieces that split its characters of several bytes
+    this.failCommands = [];   // commands that are answered with an error
     this.token = "";          // when set, a connection must send the auth command with this token first
     this.oldPlugin = false;   // a plugin from before the token check: it does not know the auth command
     this.auths = 0;           // connections that passed the token check
+    this.dialogs = [];        // file dialogs, for listFileDialogs
   }
 
   // -- tree helpers
@@ -73,18 +89,57 @@ export class FakeInspector {
     return this.log.filter((e) => e.command === name);
   }
 
+  // The texts that password fields hold now.
+  secrets() {
+    const out = new Set();
+    for (const n of this.all()) if (hidesText(n) && n.identifying.text) out.add(n.identifying.text);
+    return out;
+  }
+  // The popup that owns a popup item. In these trees the popup object is a child of its item, or its parent.
+  ownerOf(n) {
+    if (!n.type.includes("PopupItem")) return null;
+    return n.children.find(isPopup) || (n.owner && isPopup(n.owner) ? n.owner : null) || (n.parent && isPopup(n.parent) ? n.parent : null);
+  }
+
   // -- protocol
   serialize(n, maxDepth, depth) {
     const out = { id: n.id, type: n.type, objectName: n.objectName, inherits: n.inherits };
+    const fresh = this.plugin === "new";
+    const secrets = fresh ? this.secretsNow || this.secrets() : new Set();
     if (isWindow(n)) {
       Object.assign(out, { visible: n.visible, active: true, geometry: { x: n.x, y: n.y, width: n.w, height: n.h } });
     } else if (isItem(n)) {
       Object.assign(out, { visible: this.effectiveVisible(n), enabled: this.effectiveEnabled(n), opacity: 1,
                            geometry: { x: n.x, y: n.y, width: n.w, height: n.h } });
     }
-    for (const [k, v] of Object.entries(n.identifying)) if (v !== "" && v != null) out[k] = v;
+    for (const [k, v] of Object.entries(n.identifying)) {
+      if (v === "" || v == null) continue;
+      if (fresh && ((hidesText(n) && TYPED_TEXT.includes(k)) || secrets.has(v))) out.secret = true;
+      else out[k] = v;
+    }
+    let children = n.children;
+    if (fresh) {
+      if (isEchoField(n)) {
+        out.echoMode = n.props.echoMode || 0;
+        if (hidesText(n)) Object.assign(out, { secret: true, textLength: (n.identifying.text || "").length });
+      }
+      if (isItem(n)) {
+        if (this.focus === n.id) out.activeFocus = true;
+        if (n.props.checked === true && this.effectiveVisible(n)) out.checked = true;
+      }
+      if (isPopup(n)) Object.assign(out, { modal: !!n.props.modal, opened: !!n.props.opened });
+      const owner = this.ownerOf(n);
+      if (owner) {
+        out.popup = { id: owner.id, type: owner.type, objectName: owner.objectName, modal: !!owner.props.modal, opened: !!owner.props.opened };
+        if (owner.identifying.title) out.popup.title = owner.identifying.title;
+        children = children.filter((c) => c !== owner);
+      }
+      if (n.inherits.includes("QQuickFlickable")) {
+        for (const k of ["contentX", "contentY", "contentWidth", "contentHeight", "originX", "originY"]) out[k] = n.props[k] || 0;
+      }
+    }
     if (depth < maxDepth) {
-      out.children = n.children.map((c) => this.serialize(c, maxDepth, depth + 1));
+      out.children = children.map((c) => this.serialize(c, maxDepth, depth + 1));
     }
     out.childCount = n.children.length;
     return out;
@@ -103,6 +158,15 @@ export class FakeInspector {
   }
   handle(command, params) {
     this.log.push({ command, params });
+    if (this.failCommands.includes(command)) throw new Error(`${command} failed`);
+    const fresh = this.plugin === "new";
+    const secrets = fresh ? this.secrets() : new Set();
+    this.secretsNow = secrets; // for serialize(), during this command
+    const hidden = (n, property, v) => fresh && ((hidesText(n) && TYPED_TEXT.includes(property)) || (typeof v === "string" && secrets.has(v)));
+    // As the plugin does: the text of a password field inside a list or a map is replaced too.
+    const deep = (v) => (typeof v === "string" ? (secrets.has(v) ? "(hidden)" : v) : Array.isArray(v) ? v.map(deep)
+      : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deep(x)])) : v);
+    const holdsSecret = (v) => JSON.stringify(deep(v)) !== JSON.stringify(v);
     const target = () => {
       const n = this.get(params.objectId);
       if (!n) throw new Error("Object not found: " + params.objectId);
@@ -111,8 +175,8 @@ export class FakeInspector {
     switch (command) {
       case "getTree": {
         const depth = params.depth ?? 4;
-        if (params.objectId) return { tree: this.serialize(target(), depth, 0) };
-        return { tree: this.serialize(this.root, depth, 0) };
+        const tree = this.serialize(params.objectId ? target() : this.root, depth, 0);
+        return fresh ? { tree, states: true } : { tree };
       }
       case "findByProperty": {
         const matches = [];
@@ -120,8 +184,14 @@ export class FakeInspector {
         for (const seed of seeds) for (const n of this.all(seed)) {
           const v = this.value(n, params.property);
           if (v === undefined) continue;
+          if (hidden(n, params.property, v)) {
+            if (!("value" in params)) matches.push({ ...this.serialize(n, 0, 0), value: null, hidden: true });
+            continue;
+          }
+          // A list that holds a hidden text is never compared either.
+          if (fresh && "value" in params && holdsSecret(v)) continue;
           if ("value" in params && v !== params.value && String(v) !== String(params.value)) continue;
-          matches.push({ ...this.serialize(n, 0, 0), value: v });
+          matches.push({ ...this.serialize(n, 0, 0), value: fresh ? deep(v) : v });
         }
         return { matches, count: matches.length };
       }
@@ -131,11 +201,20 @@ export class FakeInspector {
       }
       case "getProperties": {
         const n = target();
-        const names = ["objectName", "visible", "enabled", "width", "height", "x", "y", "activeFocus",
+        let names = ["objectName", "visible", "enabled", "width", "height", "x", "y", "activeFocus",
                        ...Object.keys(n.identifying), ...Object.keys(n.props)];
+        // The plugin from 2.0 on reads only the properties it is asked for.
+        if (fresh && Array.isArray(params.names)) names = names.filter((name) => params.names.includes(name));
+        this.propertyReads = (this.propertyReads || 0) + new Set(names).size;
         return { id: n.id, type: n.type,
-                 properties: [...new Set(names)].map((name) => ({ name, type: "QVariant", value: this.value(n, name) ?? null, writable: true })),
-                 methods: [] };
+                 properties: [...new Set(names)].map((name) => {
+                   const value = this.value(n, name) ?? null;
+                   const p = { name, type: typeof value === "boolean" ? "bool" : typeof value === "number" ? "double" : "QString", value, writable: !["width", "height"].includes(name) };
+                   if (hidden(n, name, value)) return { ...p, value: null, hidden: true };
+                   if (fresh) p.value = deep(value);
+                   return p;
+                 }),
+                 methods: Object.keys(n.methods).map((name) => ({ name, signature: `${name}()`, returnType: "void", kind: "method" })) };
       }
       case "setProperty": {
         const n = target();
@@ -189,22 +268,27 @@ export class FakeInspector {
       case "callMethod": {
         const n = target();
         const method = n.methods[params.method];
-        return { result: method ? method(this, n, ...(params.args || [])) ?? null : null };
+        const result = method ? method(this, n, ...(params.args || [])) ?? null : null;
+        const hide = (v) => (Array.isArray(v) ? v.map(hide) : typeof v === "string" && secrets.has(v) ? "(hidden)" : v);
+        return { result: fresh ? hide(result) : result };
       }
-      case "evaluate":
-        return { result: this.evaluateResult ?? null, undefined: false };
+      case "evaluate": {
+        const result = this.evaluateResult ?? null;
+        return { result: fresh && secrets.has(result) ? "(hidden)" : result, undefined: false };
+      }
       case "screenshot":
         return { image: Buffer.from("fake png bytes").toString("base64"), width: 800, height: 600, format: "png" };
       case "listFileDialogs":
-        return { dialogs: [], count: 0 };
+        return { dialogs: this.dialogs.map((d) => this.serialize(d, 50, 0)) };
       default:
         throw new Error("Unknown command: " + command);
     }
   }
 
-  async listen() {
+  async listen(port = 0) {
     this.server = net.createServer((socket) => {
       this.sockets.add(socket);
+      this.connections++;
       socket.setNoDelay(true);
       socket.on("close", () => this.sockets.delete(socket));
       let buffer = "";
@@ -217,6 +301,7 @@ export class FakeInspector {
           buffer = buffer.slice(idx + 1);
           if (!line.trim()) continue;
           const request = JSON.parse(line);
+          this.requests.push(request);
           if (!this.oldPlugin && (request.command === "auth" || (this.token && !authed))) {
             // The same rule as the plugin: the token first, and the connection is closed on a miss.
             const good = !this.token || (request.command === "auth" && (request.params || {}).token === this.token);
@@ -237,12 +322,25 @@ export class FakeInspector {
             reply = { error: err.message };
           }
           reply.id = request.id;
-          const send = () => socket.write(JSON.stringify(reply) + "\n");
+          if (this.plugin === "new" && reply.ok) reply.secretsHidden = true;
+          const send = async () => {
+            const bytes = Buffer.from(JSON.stringify(reply) + "\n", "utf8");
+            if (!this.splitCharacters) return socket.write(bytes);
+            // In pieces that end in the middle of a character of several bytes, with a pause, so that each piece arrives alone.
+            const cuts = [];
+            for (let at = 1; at < bytes.length && cuts.length < 12; at++) if ((bytes[at] & 0xc0) === 0x80 && (bytes[at - 1] & 0x80)) cuts.push(at++);
+            let from = 0;
+            for (const at of [...cuts, bytes.length]) {
+              socket.write(bytes.subarray(from, at));
+              from = at;
+              await new Promise((resolve) => setTimeout(resolve, 4));
+            }
+          };
           if (this.delayMs) setTimeout(send, this.delayMs); else send();
         }
       });
     });
-    await new Promise((resolve) => this.server.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => this.server.listen(port, "127.0.0.1", resolve));
     return this.server.address().port;
   }
 

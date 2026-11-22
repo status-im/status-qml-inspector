@@ -1,25 +1,27 @@
 // Reads the object tree from the inspector plugin and turns it into a short list of what is on screen:
 // one line per element that a user can see or act on, each with a reference.
+import { GENERIC_PROFILE } from "./profile.mjs";
 
-const STRONG = /Button|Delegate|ComboBox|Slider|Switch|CheckBox|Radio|SpinBox|MenuItem|ListItem/i;
-const INPUT_WRAPPER = /Input|TextField|TextArea|SearchBox/i;
-// Names that parts of controls carry in every instance. They do not identify an element.
-const GENERIC_NAME = /^(buttonText|buttonBackground|buttonIcon|rightTextLoader|leftTextLoader|statusBaseInput|statusRoundIcon|statusRoundImage|textContent|.*_sensor)$/;
 const LABEL_MAX = 80;
 const MAX_DRAWER_QUESTIONS = 4; // per read
+// The keys of a tree node that hold a text of the app.
+const TEXT_KEYS = ["text", "title", "label", "placeholderText", "currentText", "source"];
 
 export const shortType = (type) => String(type || "").split(/_QMLTYPE_|_QML_/)[0];
 const inherits = (n, name) => n.type === name || (n.inherits || []).includes(name);
 const isWindow = (n) => "active" in n || inherits(n, "QQuickWindow") || inherits(n, "QWindow");
+const isPopup = (n) => inherits(n, "QQuickPopup");
 const isItem = (n) => !!n.geometry && !isWindow(n);
 const isEditor = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QQuickTextEdit");
+// The Qt fields that can hide what is typed (echoMode).
+const isEchoField = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QLineEdit");
 const isText = (n) => inherits(n, "QQuickText");
 const isMouseArea = (n) => inherits(n, "QQuickMouseArea");
 // Parts of a control (its background, its indicator) carry the control's word in their type name.
-const PART = /Cursor|(Background|Indicator|Icon|Loader|Text|Content|Label)$/;
-const isStrong = (n) => !PART.test(shortType(n.type)) && (STRONG.test(shortType(n.type)) || (n.inherits || []).some((t) => STRONG.test(t)));
+const PART = /Cursor|(Background|Indicator|Icon|Loader|Text|Content|Label|Panel)$/;
 const clean = (s) => String(s ?? "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 const ownLabel = (n) => clean(typeof n.text === "string" ? n.text : "") || clean(typeof n.title === "string" ? n.title : "") || clean(typeof n.label === "string" ? n.label : "");
+// Every text of the app goes into a line in quotes, as one JSON string: it cannot end the line or look like another field.
 const quote = (s) => JSON.stringify(s.length > LABEL_MAX ? s.slice(0, LABEL_MAX - 1) + "…" : s);
 
 function intersect(a, b) {
@@ -35,28 +37,133 @@ async function ids(bridge, property, value) {
   return new Map((reply.matches || []).map((m) => [String(m.id), m]));
 }
 
-// -> { window, elements, nodes (id -> record), modal, key }
+// ---- password fields
+//
+// What a password field holds must never reach the agent. A plugin from version 2.0 on leaves these texts out
+// itself and says so in its replies (secretsHidden). For an older plugin the server finds the fields
+// (one search for echoMode) and removes their text from the reply before anything else looks at it.
+
+export const pluginHidesSecrets = (reply) => reply && reply.secretsHidden === true;
+
+// -> { ids: the fields that hide their text, values: the texts they hold }
+export async function findSecrets(bridge) {
+  const reply = await bridge.send("findByProperty", { property: "echoMode" });
+  if (reply.error) {
+    throw new Error(`Qt Inspector error: could not look for password fields (${reply.error}). Nothing is shown, so that no password is shown.`);
+  }
+  const found = { ids: new Set(), values: new Set() };
+  for (const m of reply.matches || []) {
+    if (m.value === 0) continue; // 0 is Normal: the field shows its text
+    found.ids.add(String(m.id));
+    if (typeof m.text === "string" && m.text) found.values.add(m.text);
+  }
+  return found;
+}
+
+// Removes the hidden texts from a tree node and its children, in place. A wrapper often repeats the text
+// of its field in a property of its own, so every text that equals a hidden one is removed too.
+// The search for the fields is a second request, made after the tree was read. If the user typed in between, the field
+// held another text when the tree was read. That text is in the tree itself (one reply is one moment in the app),
+// so the texts of the fields are taken from the tree too.
+export function hideSecrets(raw, secrets) {
+  const values = new Set(secrets.values);
+  const collect = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (secrets.ids.has(String(n.id))) for (const key of TEXT_KEYS) if (typeof n[key] === "string" && n[key]) values.add(n[key]);
+    for (const child of n.children || []) collect(child);
+  };
+  collect(raw);
+  return hideIn(raw, { ids: secrets.ids, values });
+}
+
+function hideIn(raw, secrets) {
+  if (!raw || typeof raw !== "object") return raw;
+  if (secrets.ids.has(String(raw.id))) {
+    if (!("textLength" in raw)) raw.textLength = typeof raw.text === "string" ? raw.text.length : 0;
+    delete raw.text;
+    raw.secret = true;
+  }
+  for (const key of TEXT_KEYS) {
+    if (typeof raw[key] === "string" && raw[key] && secrets.values.has(raw[key])) {
+      delete raw[key];
+      raw.secret = true;
+    }
+  }
+  for (const child of raw.children || []) hideIn(child, secrets);
+  return raw;
+}
+
+// ---- scrolling
+
+// Position and range of a list along one axis, on a scale that starts at 0. `props` are properties of the
+// flickable; its own contentY starts at originY, which is not always 0.
+export function scrollAxis(props, axis, viewSize) {
+  const [property, size, originName] = axis === "y" ? ["contentY", "contentHeight", "originY"] : ["contentX", "contentWidth", "originX"];
+  const origin = Number(props[originName]) || 0;
+  const max = Math.max(0, Math.round((Number(props[size]) || 0) - viewSize));
+  const at = Math.min(max, Math.max(0, Math.round((Number(props[property]) || 0) - origin)));
+  return { property, origin, at, max };
+}
+
+// ---- the screen
+
+// -> { window, elements, nodes (id -> record), modal, key, shown, place }
 // `known` remembers, per object id, whether an item outside the window is a drawer, so each one is asked once.
-export async function readScreen(bridge, known = new Map()) {
+// options.light: only { key, finish } is returned, from the tree alone. It is for comparing two reads while the screen
+//   settles: no states are asked for, and nothing of it may be shown.
+//   `finish({ settled })` then asks for the states of that same tree and returns the whole screen.
+export async function readScreen(bridge, known = new Map(), { profile = GENERIC_PROFILE, light = false } = {}) {
   const reply = await bridge.send("getTree", { depth: 200 });
   if (reply.error) throw new Error(`Qt Inspector error: ${reply.error}`);
-  // One request at a time: small replies sent back to back wait for each other on the socket.
-  const checked = await ids(bridge, "checked", true);
-  const focused = await ids(bridge, "activeFocus", true);
-  const modalTrue = await ids(bridge, "modal", true);
-  const opened = modalTrue.size ? await ids(bridge, "opened", true) : new Map();
-  const modalPopups = [...modalTrue.values()].filter((p) => opened.has(String(p.id)));
-  const modal = modalPopups.length ? modalPopups[modalPopups.length - 1] : null;
+  if (!light) return interpret(bridge, reply, known, profile, false, false);
+  const { key } = await interpret(bridge, reply, known, profile, true, false);
+  // settled: two reads in a row were the same. Only then may an item be asked whether it is a drawer.
+  return { key, finish: ({ settled = false } = {}) => interpret(bridge, reply, known, profile, false, settled) };
+}
+
+async function interpret(bridge, reply, known, profile, light, settled) {
+
+  const isStrong = (n) => !PART.test(shortType(n.type)) && (profile.control.test(shortType(n.type)) || (n.inherits || []).some((t) => profile.control.test(t)));
+  const isPartName = (name) => !!name && !!profile.partName && profile.partName.test(name);
+  const iconOf = (name) => {
+    for (const pattern of profile.iconNames) {
+      const m = pattern.exec(name || "");
+      if (m) return m[1] ?? m[0];
+    }
+    return "";
+  };
+
+  if (!light && !pluginHidesSecrets(reply)) {
+    // An older plugin: its tree holds the text of every field. Look for password fields only when the tree has a field that could be one.
+    let hasField = false;
+    const look = (n) => { if (isEchoField(n)) hasField = true; else (n.children || []).forEach(look); };
+    look(reply.tree || {});
+    if (hasField) hideSecrets(reply.tree, await findSecrets(bridge));
+  }
+
+  // The states of the elements. A plugin from 2.0 on sends them with the tree. For an older plugin each state
+  // is one search of the whole tree. One request at a time: small replies sent back to back wait for each other on the socket.
+  const fromTree = reply.states === true;
+  let checked = new Map(), focused = new Map(), modal = null;
+  if (!light && !fromTree) {
+    checked = await ids(bridge, "checked", true);
+    focused = await ids(bridge, "activeFocus", true);
+    const modalTrue = await ids(bridge, "modal", true);
+    const opened = modalTrue.size ? await ids(bridge, "opened", true) : new Map();
+    const modalPopups = [...modalTrue.values()].filter((p) => opened.has(String(p.id)));
+    modal = modalPopups.length ? modalPopups[modalPopups.length - 1] : null;
+  }
 
   // Pass 1: one record per object, with its place in the window.
   const nodes = new Map();
   let window = null;
-  const build = (raw, parent, origin, visible, clip, flick, overlay, win) => {
+  const build = (raw, parent, origin, visible, clip, flick, overlay, win, drawer) => {
     const id = String(raw.id);
     if (raw.id !== "" && nodes.has(id)) return null;
     const rec = { id, raw, parent, type: shortType(raw.type), objectName: raw.objectName || "", children: [], visible, enabled: raw.enabled !== false,
-                  rect: null, clip, flick, overlay, win, item: false, drawer: null };
+                  rect: null, clip, flick, overlay, win, item: false, drawer };
     if (raw.id !== "") nodes.set(id, rec);
+    let children = raw.children || [];
     if (isWindow(raw)) {
       rec.visible = visible = raw.visible !== false;
       win = { w: raw.geometry?.width || 0, h: raw.geometry?.height || 0, title: raw.title || "" };
@@ -67,9 +174,27 @@ export async function readScreen(bridge, known = new Map()) {
       rec.clip = clip;
       flick = null;
       overlay = false;
+    } else if (isPopup(raw) && !isItem(raw)) {
+      // A popup object (a dialog, a menu, a drawer). When it is open, its content is a child of the overlay and is
+      // read there. When it is closed, the content is not on the screen; only a closed Qt Quick Drawer is read,
+      // because a click on one of its elements can open it.
+      const popupItem = children.find((c) => inherits(c, "QQuickPopupItem"));
+      const open = typeof raw.opened === "boolean" ? raw.opened : !!popupItem && popupItem.visible !== false;
+      if (!open && popupItem && inherits(raw, "QQuickDrawer")) {
+        rec.rect = { x: 0, y: 0, w: 0, h: 0 };
+        rec.stockDrawer = true;
+        rec.drawer = drawer = rec;
+        origin = { x: 0, y: 0 };
+        clip = null;
+        flick = null;
+        children = [popupItem];
+      } else {
+        children = [];
+      }
     } else if (isItem(raw)) {
       rec.item = true;
-      rec.visible = visible = visible && raw.visible !== false;
+      // Inside a closed Qt Quick Drawer every item reports "not visible", because the drawer is. They are read as they will be when it opens.
+      rec.visible = visible = drawer && drawer.stockDrawer ? true : visible && raw.visible !== false;
       const g = raw.geometry;
       rec.rect = { x: origin.x + (g.x || 0), y: origin.y + (g.y || 0), w: g.width || 0, h: g.height || 0 };
       origin = { x: rec.rect.x, y: rec.rect.y };
@@ -81,44 +206,66 @@ export async function readScreen(bridge, known = new Map()) {
         rec.viewport = clip;
       }
     }
-    for (const child of raw.children || []) {
-      const c = build(child, rec, origin, visible, clip, flick, overlay, win);
+    for (const child of children) {
+      const c = build(child, rec, origin, visible, clip, flick, overlay, win, drawer);
       if (c) rec.children.push(c);
     }
     return rec;
   };
-  const root = build(reply.tree, null, { x: 0, y: 0 }, true, null, null, false, null);
+  const root = build(reply.tree, null, { x: 0, y: 0 }, true, null, null, false, null, null);
 
   const shown = (rec) => rec.item && rec.visible && rec.rect.w >= 2 && rec.rect.h >= 2;
 
-  // A closed drawer: a visible item that lies outside the window, holds controls, and has `opened` = false and a `position`.
-  // Only such items are asked for their properties. Asking every object for `opened` made the Status app exit during a page change.
-  const hasControl = (rec) => rec.children.some((c) => (!c.item || c.visible) && ((c.item && isStrong(c.raw)) || hasControl(c)));
-  const outside = [];
-  const seek = (rec) => {
-    if (rec.item && !rec.visible) return;
-    if (rec.item && rec.win && shown(rec)) {
-      const part = intersect({ x: 0, y: 0, w: rec.win.w, h: rec.win.h }, rec.rect);
-      if (part.w < 1 || part.h < 1) {
-        if (hasControl(rec)) outside.push(rec);
-        return;
-      }
+  if (!light && fromTree) {
+    // Same order as the searches of an older plugin: level by level, and the last open modal popup counts.
+    const queue = root ? [root] : [];
+    for (let k = 0; k < queue.length; k++) {
+      const rec = queue[k];
+      if (rec.raw.checked === true) checked.set(rec.id, rec.raw);
+      if (rec.raw.activeFocus === true) focused.set(rec.id, rec.raw);
+      const popup = rec.raw.popup;
+      if (popup && popup.modal === true && popup.opened === true) modal = popup;
+      queue.push(...rec.children);
     }
-    rec.children.forEach(seek);
-  };
-  if (root) seek(root);
-  let asked = 0;
-  for (const rec of outside) {
-    if (!known.has(rec.id)) {
-      if (asked++ >= MAX_DRAWER_QUESTIONS) continue;
-      const reply = await bridge.send("getProperties", { objectId: rec.id });
-      const props = new Map((reply.properties || []).map((p) => [p.name, p.value]));
-      known.set(rec.id, !reply.error && props.get("opened") === false && typeof props.get("position") === "number");
-    }
-    if (!known.get(rec.id)) continue;
-    const mark = (r) => { r.drawer = rec; r.children.forEach(mark); };
-    mark(rec);
   }
+
+  // A drawer that is a plain item (profile: itemDrawers). When closed it is a visible item that lies outside the window,
+  // holds controls, and has `opened` = false and a `position`. Only such items are asked for these two properties, and each one once.
+  // An item is asked only when the screen has stopped moving (`settled`): while a page is being replaced, its items lie
+  // outside the window too, and reading the properties of such an item has made an app exit.
+  // Until an item was asked, it does not count as a drawer. An item that was asked before keeps its answer,
+  // also while the screen moves.
+  if (profile.itemDrawers) {
+    const hasControl = (rec) => rec.children.some((c) => (!c.item || c.visible) && ((c.item && isStrong(c.raw)) || hasControl(c)));
+    const outside = [];
+    const seek = (rec) => {
+      if (rec.item && !rec.visible) return;
+      if (rec.drawer) return;
+      if (rec.item && rec.win && shown(rec)) {
+        const part = intersect({ x: 0, y: 0, w: rec.win.w, h: rec.win.h }, rec.rect);
+        if (part.w < 1 || part.h < 1) {
+          if (hasControl(rec)) outside.push(rec);
+          return;
+        }
+      }
+      rec.children.forEach(seek);
+    };
+    if (root) seek(root);
+    let asked = 0;
+    for (const rec of outside) {
+      if (!known.has(rec.id)) {
+        if (!settled || asked++ >= MAX_DRAWER_QUESTIONS) continue;
+        const props = await propertiesOf(bridge, rec.id, ["opened", "position"]);
+        known.set(rec.id, !!props && props.get("opened") === false && typeof props.get("position") === "number");
+      }
+      if (!known.get(rec.id)) continue;
+      const mark = (r) => { r.drawer = rec; r.children.forEach(mark); };
+      mark(rec);
+    }
+  }
+  // An id that is gone may be given to another object after the app starts again.
+  for (const id of [...known.keys()]) if (!nodes.has(id)) known.delete(id);
+
   const place = (rec) => {
     const cx = rec.rect.x + rec.rect.w / 2, cy = rec.rect.y + rec.rect.h / 2;
     const inView = !!rec.clip && contains(rec.clip, cx, cy);
@@ -129,17 +276,30 @@ export async function readScreen(bridge, known = new Map()) {
   };
 
   // Pass 2: text fields. The editor is the object to click and type into; its wrapper carries the name and the label.
+  // A wrapper is an ancestor that holds this editor and no other one: a panel with two fields is not the wrapper of either.
+  const editors = [...nodes.values()].filter((rec) => isEditor(rec.raw) && shown(rec));
+  const editorsUnder = new Map(); // ancestor id -> number of editors below it
+  for (const rec of editors) {
+    for (let p = rec.parent, depth = 0; p && p.item && depth < 10; p = p.parent, depth++) editorsUnder.set(p.id, (editorsUnder.get(p.id) || 0) + 1);
+  }
   const wrapperOf = new Map(); // wrapper id -> editor record
-  for (const rec of nodes.values()) {
-    if (!isEditor(rec.raw) || !shown(rec)) continue;
+  for (const rec of editors) {
     let wrapper = rec, best = null;
     for (let p = rec.parent, depth = 0; p && p.item && depth < 10; p = p.parent, depth++) {
-      if (!INPUT_WRAPPER.test(p.type)) continue;
+      if (editorsUnder.get(p.id) > 1) break;
+      if (!profile.inputWrapper.test(p.type)) continue;
       wrapper = p;
-      if (p.objectName && !GENERIC_NAME.test(p.objectName)) { best = p; break; }
+      if (p.objectName && !isPartName(p.objectName)) { best = p; break; }
     }
     wrapper = best || wrapper;
     if (!wrapperOf.has(wrapper.id)) wrapperOf.set(wrapper.id, rec);
+  }
+
+  // Lists that can be scrolled: where they are and how far they go. A plugin from 2.0 on sends this with the tree.
+  // With an older plugin the position is taken from the geometry (see geometryScroll): asking each list for its properties
+  // on every read would run every getter of the list.
+  for (const rec of nodes.values()) {
+    if ("contentY" in rec.raw && rec.item && shown(rec)) rec.scroll = scrollAxis(rec.raw, "y", rec.rect.h);
   }
 
   // Pass 3: the list.
@@ -167,7 +327,7 @@ export async function readScreen(bridge, known = new Map()) {
   };
   const nested = (c) => wrapperOf.has(c.id) || (c.item && isStrong(c.raw));
   const emit = (rec, fields) => {
-    const el = { id: rec.id, ref: "e" + rec.id, type: rec.type, objectName: GENERIC_NAME.test(rec.objectName) ? "" : rec.objectName, texts: [], label: "",
+    const el = { id: rec.id, ref: "e" + rec.id, type: rec.type, objectName: isPartName(rec.objectName) ? "" : rec.objectName, texts: [], label: "",
                  enabled: rec.enabled, checked: checked.has(rec.id), rect: rec.rect, flick: rec.flick, behindModal: !!modal && !rec.overlay, ...place(rec), ...fields };
     el.line = formatElement(el);
     elements.push(el);
@@ -176,24 +336,28 @@ export async function readScreen(bridge, known = new Map()) {
     if (rec.item && !rec.visible) return;
     let childQuiet = quiet;
     if (rec.drawer === rec) {
-      emit(rec, { kind: "drawer" });
+      emit(rec, { kind: "drawer", ...(rec.stockDrawer ? { inView: true, reachable: true, drawerId: null } : {}) });
     } else if (wrapperOf.has(rec.id)) {
       const editor = wrapperOf.get(rec.id);
       const placeholderNode = [rec, ...descendants(rec)].find((n) => typeof n.raw.placeholderText === "string" && n.raw.placeholderText);
       const placeholder = placeholderNode ? clean(placeholderNode.raw.placeholderText) : "";
-      const value = typeof editor.raw.text === "string" ? editor.raw.text : "";
-      const texts = textsUnder(rec, [], (c) => c !== editor && nested(c)).filter((t) => t !== placeholder && t !== clean(value));
+      // A password field: the plugin, or hideSecrets above, took its text out of the tree. Only its length is known.
+      const hidden = editor.raw.secret === true;
+      const value = !hidden && typeof editor.raw.text === "string" ? editor.raw.text : "";
+      const length = hidden ? Number(editor.raw.textLength) || 0 : value.length;
+      const texts = textsUnder(rec, [], (c) => c !== editor && nested(c)).filter((t) => t !== placeholder && (hidden || t !== clean(value)));
       // The wrapper's own "text" is the value, not the label.
       const named = rec !== editor ? clean(typeof rec.raw.label === "string" ? rec.raw.label : "") || clean(typeof rec.raw.title === "string" ? rec.raw.title : "") : "";
       const label = named || texts[0] || "";
       const target = shown(rec) ? rec : editor;
-      emit(editor, { kind: "input", type: rec.type, objectName: GENERIC_NAME.test(rec.objectName) ? "" : rec.objectName, texts: label ? [label] : [], label,
-                     value, placeholder, focused: focused.has(editor.id), enabled: editor.enabled && rec.enabled, rect: target.rect, ...place(target) });
-      childQuiet = true;
-    } else if (rec.item && shown(rec) && rec.viewport && rec.viewport.h > 0 && scrollRange(rec)) {
+      emit(editor, { kind: "input", type: rec.type, objectName: isPartName(rec.objectName) ? "" : rec.objectName, texts: label ? [label] : [], label,
+                     value, hidden, length, placeholder, focused: focused.has(editor.id), enabled: editor.enabled && rec.enabled, rect: target.rect, ...place(target) });
+      // The other texts inside the wrapper (an error under the field, a counter, the texts of a whole page whose type
+      // name looks like a wrapper) are lines of their own. Only what the line of the field already shows is left out.
+      childQuiet = rec === editor ? true : { editor, used: new Set([label, placeholder, clean(value)].filter(Boolean)) };
+    } else if (rec.item && shown(rec) && rec.viewport && rec.viewport.h > 0 && contentHeight(rec)) {
       // A list with more content than fits. Rows far outside the visible part do not exist until the list is scrolled.
-      const range = scrollRange(rec);
-      emit(rec, { kind: "scroll", scroll: range });
+      emit(rec, { kind: "scroll", scroll: rec.scroll || geometryScroll(rec) });
     } else if (rec.item && shown(rec) && isStrong(rec.raw)) {
       const texts = textsUnder(rec, [], nested);
       const own = ownLabel(rec.raw);
@@ -201,43 +365,59 @@ export async function readScreen(bridge, known = new Map()) {
       // A control with no text of its own that wraps another control is a shell: the inner one is listed.
       const shell = !texts.length && !!find(rec, nested);
       if (!shell) {
-        const iconNode = texts.length ? null : find(rec, (c) => /-icon$/.test(c.objectName));
+        const iconNode = texts.length ? null : find(rec, (c) => !!iconOf(c.objectName));
         // A switch inside a list row has no text of its own: the row says what it is for.
         const within = !texts.length && owner && owner.label ? owner.label : "";
-        emit(rec, { kind: "control", texts, label: texts.join(" | "), within, icon: iconNode ? iconNode.objectName.replace(/-icon$/, "") : "" });
+        emit(rec, { kind: "control", texts, label: texts.join(" | "), within, icon: iconNode ? iconOf(iconNode.objectName) : "" });
         childQuiet = true;
         owner = elements[elements.length - 1];
       }
     } else if (rec.item && shown(rec) && isMouseArea(rec.raw) && !quiet) {
       // A bare mouse area is an element only when it has a name or a text of its own.
       // One that wraps other controls is a container: its children are listed instead.
-      const named = rec.objectName && !GENERIC_NAME.test(rec.objectName);
+      const named = rec.objectName && !isPartName(rec.objectName);
       const container = !!find(rec, (c) => nested(c) || isMouseArea(c.raw));
       const texts = container ? [] : textsUnder(rec, [], nested);
       if (named || texts.length) {
         emit(rec, { kind: "control", texts, label: texts.join(" | "), icon: "" });
         childQuiet = !container;
       }
-    } else if (rec.item && shown(rec) && isText(rec.raw) && !quiet) {
+    } else if (rec.item && shown(rec) && isText(rec.raw) && (!quiet || quiet.used)) {
       const t = clean(rec.raw.text);
-      if (t) emit(rec, { kind: "text", texts: [t], label: t });
+      if (t && !(quiet && quiet.used.has(t))) emit(rec, { kind: "text", texts: [t], label: t });
     }
-    for (const c of rec.children) walk(c, childQuiet, owner);
+    // Inside the editor itself everything belongs to the field (its placeholder, its cursor).
+    const below = childQuiet && childQuiet.editor === rec ? true : childQuiet;
+    for (const c of rec.children) walk(c, below, owner);
   };
   if (root) walk(root, false);
 
   const listed = elements.filter((e) => e.reachable && !e.behindModal);
   const key = JSON.stringify([modal ? modal.id : null, listed.map((e) => [e.line, e.rect.x, e.rect.y, e.rect.w, e.rect.h])]);
+  if (light) return { key };
   return { window, elements, nodes, modal, key, shown, place };
 }
 
-// -> { at, max } when the content of a scrollable item is higher than the item, else null.
-function scrollRange(rec) {
-  const content = rec.children.find((c) => c.item && !/ScrollBar|ScrollIndicator/.test(c.type));
-  if (!content) return null;
-  const max = Math.round(content.rect.h - rec.rect.h);
-  if (max < 20) return null;
-  return { at: Math.max(0, Math.round(rec.rect.y - content.rect.y)), max };
+// `names`: a plugin from 2.0 on reads only these properties. An older plugin reads all of them.
+async function propertiesOf(bridge, objectId, names) {
+  const reply = await bridge.send("getProperties", { objectId, names });
+  if (reply.error) return null;
+  return new Map((reply.properties || []).map((p) => [p.name, p.value]));
+}
+
+const contentItemOf = (rec) => rec.children.find((c) => c.item && !/ScrollBar|ScrollIndicator/.test(c.type));
+
+// Is the content of a scrollable item higher than the item (by more than a few pixels)?
+function contentHeight(rec) {
+  const content = contentItemOf(rec);
+  return !!content && Math.round(content.rect.h - rec.rect.h) >= 20;
+}
+
+// Position and range from the geometry alone, for a plugin before 2.0. Right when the content starts at 0 (originY = 0).
+// For a list whose content starts elsewhere (a chat that grows upwards), the position can be off; qml_scroll is right for it.
+function geometryScroll(rec) {
+  const content = contentItemOf(rec);
+  return { at: Math.max(0, Math.round(rec.rect.y - content.rect.y)), max: Math.round(content.rect.h - rec.rect.h) };
 }
 
 function descendants(rec, out = []) {
@@ -252,16 +432,17 @@ export function formatElement(el) {
   let line = `[${el.ref}] ${el.type}`;
   if (el.label) line += ` ${quote(el.label)}`;
   if (el.within) line += ` in ${quote(el.within)}`;
-  if (el.objectName) line += ` objectName=${/\s/.test(el.objectName) ? JSON.stringify(el.objectName) : el.objectName}`;
+  if (el.objectName) line += ` objectName=${JSON.stringify(el.objectName)}`;
   if (el.kind === "input") {
-    line += ` value=${quote(el.value)}`;
+    // A password field shows only whether it is empty.
+    line += el.hidden && el.length ? " value=(hidden)" : ` value=${quote(el.value)}`;
     if (el.placeholder) line += ` placeholder=${quote(el.placeholder)}`;
   }
-  if (el.icon) line += ` icon=${el.icon}`;
+  if (el.icon) line += ` icon=${JSON.stringify(el.icon)}`;
   if (el.kind === "drawer") return `${line} drawer: closed. Its elements are listed; a click on one of them opens the drawer first.`;
   if (el.kind === "scroll") {
     const more = [el.scroll.at > 1 ? "above" : "", el.scroll.at < el.scroll.max - 1 ? "below" : ""].filter(Boolean).join(" and ");
-    line += ` scrollable: contentY=${el.scroll.at} of 0..${el.scroll.max}, more ${more}`;
+    line += ` scrollable: contentY=${el.scroll.at} of 0..${el.scroll.max}${more ? `, more ${more}` : ""}`;
   }
   const flags = [];
   if (el.checked) flags.push("checked");
@@ -277,7 +458,7 @@ export function formatObject(raw, extra = "", marks = []) {
   let line = `[e${raw.id}] ${shortType(raw.type)}`;
   const label = ownLabel(raw) || clean(typeof raw.placeholderText === "string" ? raw.placeholderText : "");
   if (label) line += ` ${quote(label)}`;
-  if (raw.objectName) line += ` objectName=${/\s/.test(raw.objectName) ? JSON.stringify(raw.objectName) : raw.objectName}`;
+  if (raw.objectName) line += ` objectName=${JSON.stringify(raw.objectName)}`;
   if (extra) line += ` ${extra}`;
   const flags = [];
   if (raw.visible === false) flags.push("hidden");

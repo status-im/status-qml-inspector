@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { FakeInspector, node, add } from "./fake-inspector.mjs";
 import { QtBridge } from "../lib/bridge.mjs";
 import { createToolset } from "../lib/tools.mjs";
+import { loadProfile } from "../lib/profile.mjs";
 
 const ITEM = ["QQuickItem", "QObject"];
 const BUTTON = ["QQuickButton", "QQuickAbstractButton", "QQuickControl", ...ITEM];
@@ -54,7 +55,8 @@ beforeEach(async () => {
   fake = new FakeInspector(app.root);
   const port = await fake.listen();
   bridge = new QtBridge({ host: "127.0.0.1", port, timeoutMs: 2000 });
-  tools = createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 300 });
+  // The drawer of these tests is a plain item, as in the Status app: its profile turns the search for such a drawer on.
+  tools = createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 300, profile: loadProfile("status") });
 });
 
 afterEach(async () => {
@@ -71,8 +73,8 @@ const call = async (name, args = {}) => {
 test("snapshot: a closed drawer is one line, and its elements are listed and marked", async () => {
   const snap = await call("qml_snapshot");
   assert.match(snap.text, new RegExp(`\\[e${app.drawer.id}\\] PrimaryNavSidebar drawer: closed`));
-  assert.match(snap.text, /RegularSectionButton objectName=Market-navbar icon=market \(in closed drawer\)/);
-  assert.match(snap.text, /RegularSectionButton objectName=Wallet-navbar icon=wallet \(checked, in closed drawer\)/);
+  assert.match(snap.text, /RegularSectionButton objectName=\"Market-navbar\" icon=\"market\" \(in closed drawer\)/);
+  assert.match(snap.text, /RegularSectionButton objectName=\"Wallet-navbar\" icon=\"wallet\" \(checked, in closed drawer\)/);
   assert.doesNotMatch(snap.text, /navbar.*not in view/);
 });
 
@@ -80,7 +82,7 @@ test("snapshot: an open drawer has no drawer line and its elements have no mark"
   app.drawer.methods.open(fake, app.drawer);
   const snap = await call("qml_snapshot");
   assert.doesNotMatch(snap.text, /drawer/);
-  assert.match(snap.text, /objectName=Market-navbar icon=market$/m);
+  assert.match(snap.text, /objectName=\"Market-navbar\" icon=\"market\"$/m);
 });
 
 test("click on an element in a closed drawer opens the drawer first, then clicks", async () => {
@@ -88,7 +90,7 @@ test("click on an element in a closed drawer opens the drawer first, then clicks
   assert.equal(r.isError, false, r.text);
   assert.deepEqual(fake.commands("callMethod").map((c) => [c.params.objectId, c.params.method]), [[app.drawer.id, "open"]]);
   assert.equal(app.title.identifying.text, "Market");
-  assert.match(r.text, /^Clicked \[e\d+\] RegularSectionButton objectName=Market-navbar icon=market \(opened the drawer first\)\./);
+  assert.match(r.text, /^Clicked \[e\d+\] RegularSectionButton objectName=\"Market-navbar\" icon=\"market\" \(opened the drawer first\)\./);
   assert.match(r.text, /changed: \[e\d+\] StatusBaseText "Market"/);
 });
 
@@ -153,11 +155,11 @@ test("click on an element outside the window that no list and no drawer can brin
 
 test("find tools mark an object that is shown but outside the window", async () => {
   const off = await call("qml_find_by_property", { property: "objectName", value: "otherPageButton" });
-  assert.match(off.text, /StatusButton "Other page" objectName=otherPageButton \(not on screen\)/);
+  assert.match(off.text, /StatusButton "Other page" objectName=\"otherPageButton\" \(not on screen\)/);
   const on = await call("qml_find_by_property", { property: "objectName", value: "title" });
   assert.doesNotMatch(on.text, /not on screen/);
   const byType = await call("qml_find_by_type", { typeName: "RegularSectionButton" });
-  assert.match(byType.text, /objectName=Market-navbar \(not on screen\)/);
+  assert.match(byType.text, /objectName=\"Market-navbar\" \(not on screen\)/);
 });
 
 test("finding a drawer does not ask every object for `opened`: only the item outside the window is asked, and once", async () => {

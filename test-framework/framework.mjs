@@ -17,14 +17,17 @@
 //   run();
 //
 // Environment:
-//   QML_INSPECTOR_HOST  (default: localhost)
-//   QML_INSPECTOR_PORT  (default: 3768)
+//   QML_INSPECTOR_HOST   (default: 127.0.0.1)
+//   QML_INSPECTOR_PORT   (default: 3768)
+//   QML_INSPECTOR_TOKEN  (default: none) the token the app was started with, if it was started with one
 // ---------------------------------------------------------------------------
 
 import net from "node:net";
 import { spawn } from "node:child_process";
 
-const HOST = process.env.QML_INSPECTOR_HOST || "localhost";
+// 127.0.0.1 and not "localhost": that name can also mean ::1, where the plugin never listens.
+const HOST = process.env.QML_INSPECTOR_HOST || "127.0.0.1";
+const TOKEN = (process.env.QML_INSPECTOR_TOKEN || "").trim();
 const PORT = parseInt(process.env.QML_INSPECTOR_PORT || "3768", 10);
 const TIMEOUT_MS = 15000;
 
@@ -33,26 +36,54 @@ const TIMEOUT_MS = 15000;
 // ---------------------------------------------------------------------------
 export class Inspector {
   constructor() {
+    this.host = HOST;
+    this.port = PORT;
     this.socket = null;
+    this.connecting = null;
     this.requestId = 0;
     this.pending = new Map();
     this.buffer = "";
+    this.reason = "";  // what the plugin said before it closed the connection
   }
 
+  // One attempt at a time: calls that arrive while the connection is being opened wait for it.
   async connect() {
     if (this.socket && !this.socket.destroyed) return;
-    return new Promise((resolve, reject) => {
-      const sock = net.createConnection({ host: HOST, port: PORT });
-      sock.once("connect", () => { this.socket = sock; resolve(); });
+    if (!this.connecting) this.connecting = this._open().finally(() => { this.connecting = null; });
+    return this.connecting;
+  }
+
+  async _open() {
+    await new Promise((resolve, reject) => {
+      const sock = net.createConnection({ host: this.host, port: this.port });
+      sock.setEncoding("utf8");
+      sock.once("connect", () => { this.socket = sock; this.reason = ""; resolve(); });
       sock.once("error", (err) => reject(new Error(`Cannot connect to inspector: ${err.message}`)));
-      sock.on("data", (chunk) => { this.buffer += chunk.toString("utf-8"); this._drain(); });
+      sock.on("data", (text) => { this.buffer += text; this._drain(); });
       sock.on("close", () => {
-        this.socket = null;
-        for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error("Connection closed")); }
+        if (this.socket === sock) this.socket = null;
+        if (this.buffer.trim()) { this.buffer += "\n"; this._drain(); }
+        this.buffer = "";
+        const error = this.reason ? `Cannot connect to inspector: it closed the connection (${this.reason})` : "Connection closed";
+        for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(error)); }
         this.pending.clear();
       });
       sock.on("error", () => {});
     });
+    // The token goes first on every new connection. The error texts never contain it.
+    if (!TOKEN) return;
+    const reply = await this._request("auth", { token: TOKEN });
+    if (!reply.error && reply.auth === "not required") {
+      // A token is set here, but the app takes commands from every program on the device.
+      this.disconnect();
+      throw new Error("Cannot connect to inspector: QML_INSPECTOR_TOKEN is set, but the app was started without a token. " +
+                      "Start the app with the same QML_INSPECTOR_TOKEN, or unset it here.");
+    }
+    if (!reply.error) return;
+    this.disconnect();
+    throw new Error(/unknown command/i.test(reply.error)
+      ? "Cannot connect to inspector: QML_INSPECTOR_TOKEN is set, but the plugin in the app is too old to check a token."
+      : "Cannot connect to inspector: the plugin did not accept the token. QML_INSPECTOR_TOKEN must have the same value here and in the app.");
   }
 
   _drain() {
@@ -65,6 +96,8 @@ export class Inspector {
         const msg = JSON.parse(line);
         const p = this.pending.get(String(msg.id));
         if (p) { clearTimeout(p.timer); this.pending.delete(String(msg.id)); p.resolve(msg); }
+        // An error line without the id of a request: the reason the plugin gives before it closes the connection.
+        else if (typeof msg.error === "string" && (msg.id === undefined || msg.id === null)) this.reason = msg.error.slice(0, 300);
       } catch {
         console.error("Error processing reply message:", line);
       }
@@ -73,9 +106,20 @@ export class Inspector {
 
   async send(command, params = {}) {
     await this.connect();
+    const reply = await this._request(command, params);
+    if (reply.error && /^Authentication required/.test(reply.error)) {
+      this.disconnect();
+      throw new Error("Cannot connect to inspector: the plugin asks for a token. Set QML_INSPECTOR_TOKEN to the value the app was started with.");
+    }
+    return reply;
+  }
+
+  _request(command, params) {
     const id = ++this.requestId;
     const payload = JSON.stringify({ id, command, params }) + "\n";
     return new Promise((resolve, reject) => {
+      // The plugin may have closed the connection already, with a reason (too many connections).
+      if (!this.socket) return reject(new Error(this.reason ? `Cannot connect to inspector: it closed the connection (${this.reason})` : "Connection closed"));
       const timer = setTimeout(() => { this.pending.delete(String(id)); reject(new Error(`Timeout: ${command}`)); }, TIMEOUT_MS);
       this.pending.set(String(id), { resolve, reject, timer });
       this.socket.write(payload);
@@ -84,6 +128,7 @@ export class Inspector {
 
   disconnect() {
     if (this.socket) this.socket.destroy();
+    this.socket = null;
   }
 }
 

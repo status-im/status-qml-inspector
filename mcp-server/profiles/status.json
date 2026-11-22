@@ -1,0 +1,12 @@
+{
+  "name": "status",
+  "description": "The Status app (desktop and mobile), built with StatusQ controls.",
+  "partNames": [
+    "buttonText", "buttonBackground", "buttonIcon", "rightTextLoader", "leftTextLoader",
+    "statusBaseInput", "statusRoundIcon", "statusRoundImage", "textContent", ".*_sensor"
+  ],
+  "iconNames": ["(.*)-icon"],
+  "controlTypes": ["ListItem"],
+  "inputWrapperTypes": ["SearchBox"],
+  "itemDrawers": true
+}

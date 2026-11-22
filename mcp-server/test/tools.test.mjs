@@ -1,11 +1,15 @@
 // Tests for the MCP tools. They run against a fake inspector on a local socket: no app is needed.
 // Run: npm test
-import { test, beforeEach, afterEach } from "node:test";
+import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { FakeInspector, node, add } from "./fake-inspector.mjs";
 import { QtBridge } from "../lib/bridge.mjs";
 import { createToolset, MAX_REPLY_CHARS } from "../lib/tools.mjs";
+import { loadProfile } from "../lib/profile.mjs";
+
+// These tests use a tree with the controls of the Status app, so they run with its profile.
+const STATUS = loadProfile("status");
 
 const BUTTON = ["QQuickButton", "QQuickAbstractButton", "QQuickControl", "QQuickItem", "QObject"];
 const ITEM = ["QQuickItem", "QObject"];
@@ -84,12 +88,19 @@ function openModal(title = "Add a new account") {
   return { popup, popupItem, closeButton };
 }
 
+// Every test runs twice: against the plugin as it is in the test builds so far ("old"), and against the plugin from 2.0 on ("new").
+for (const plugin of ["old", "new"]) describe(`with the ${plugin} plugin`, () => {
+
+// The defaults of the server: the unlimited tools are off.
+const toolset = (options = {}) => createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 80, profile: STATUS, ...options });
+
 beforeEach(async () => {
   app = buildApp();
   fake = new FakeInspector(app.root);
+  fake.plugin = plugin;
   const port = await fake.listen();
   bridge = new QtBridge({ host: "127.0.0.1", port, timeoutMs: 2000 });
-  tools = createToolset({ bridge, settleIntervalMs: 5, settleTimeoutMs: 80, unlimitedTools: true });
+  tools = toolset();
 });
 
 afterEach(async () => {
@@ -110,8 +121,8 @@ const refOf = (reply, needle) => {
 test("snapshot: one line and one reference per element, with label and objectName", async () => {
   const reply = await tools.call("qml_snapshot", {});
   assert.equal(reply.isError, undefined);
-  const save = lineWith(reply, "objectName=btnSave");
-  assert.match(save, /^\[e\d+\] StatusButton "Save" objectName=btnSave$/);
+  const save = lineWith(reply, "objectName=\"btnSave\"");
+  assert.match(save, /^\[e\d+\] StatusButton "Save" objectName=\"btnSave\"$/);
   // The label inside the button is part of the button's line, not a line of its own.
   assert.equal(text(reply).split("\n").filter((l) => l.includes('"Save"')).length, 1);
   assert.ok(!text(reply).includes("buttonBackground"));
@@ -119,22 +130,22 @@ test("snapshot: one line and one reference per element, with label and objectNam
 
 test("snapshot: the reference is the plugin's object id, so the old objectId tools take it too", async () => {
   const reply = await tools.call("qml_snapshot", {});
-  assert.equal(refOf(reply, "objectName=btnSave"), "e" + fake.byName("btnSave").id);
+  assert.equal(refOf(reply, "objectName=\"btnSave\""), "e" + fake.byName("btnSave").id);
 });
 
 test("snapshot: plain texts are listed", async () => {
   const reply = await tools.call("qml_snapshot", {});
-  assert.match(lineWith(reply, "objectName=sectionTitle"), /^\[e\d+\] StatusBaseText "Profile" objectName=sectionTitle$/);
+  assert.match(lineWith(reply, "objectName=\"sectionTitle\""), /^\[e\d+\] StatusBaseText "Profile" objectName=\"sectionTitle\"$/);
 });
 
 test("snapshot: text fields are listed with value and placeholder", async () => {
   app.editor.identifying.text = "alice";
   const reply = await tools.call("qml_snapshot", {});
-  const line = lineWith(reply, "objectName=displayNameInput");
-  assert.match(line, /StatusInput "Display name" objectName=displayNameInput value="alice" placeholder="Your name"/);
+  const line = lineWith(reply, "objectName=\"displayNameInput\"");
+  assert.match(line, /StatusInput "Display name" objectName=\"displayNameInput\" value="alice" placeholder="Your name"/);
   // One line for the field, not one per wrapper, and its reference is the editor itself.
   assert.ok(!text(reply).includes("statusBaseInput"));
-  assert.equal(refOf(reply, "objectName=displayNameInput"), "e" + app.editor.id);
+  assert.equal(refOf(reply, "objectName=\"displayNameInput\""), "e" + app.editor.id);
 });
 
 test("snapshot: hidden elements are left out, disabled and checked ones are marked", async () => {
@@ -147,7 +158,7 @@ test("snapshot: hidden elements are left out, disabled and checked ones are mark
 
 test("snapshot: a button without text shows its objectName and icon", async () => {
   const reply = await tools.call("qml_snapshot", {});
-  assert.match(lineWith(reply, "addAccountButton"), /StatusRoundButton objectName=addAccountButton icon=add-circle/);
+  assert.match(lineWith(reply, "addAccountButton"), /StatusRoundButton objectName=\"addAccountButton\" icon=\"add-circle\"/);
 });
 
 test("snapshot: a control without text inside a row is named after the row", async () => {
@@ -160,24 +171,24 @@ test("snapshot: a control without text inside a row is named after the row", asy
 
 test("snapshot: a list with more rows than fit is marked scrollable, with its position", async () => {
   const reply = await tools.call("qml_snapshot", {});
-  assert.match(lineWith(reply, "objectName=settingsList"), /SettingsList objectName=settingsList scrollable: contentY=0 of 0\.\.400, more below$/);
+  assert.match(lineWith(reply, "objectName=\"settingsList\""), /SettingsList objectName=\"settingsList\" scrollable: contentY=0 of 0\.\.400, more below$/);
   const miss = await tools.call("qml_click", { text: "Export gizmo" });
   assert.match(text(miss), /qml_scroll/);
-  assert.ok(lineWith(miss, "objectName=settingsList"));
+  assert.ok(lineWith(miss, "objectName=\"settingsList\""));
 });
 
 test("snapshot: a list row with a mouse area is one line; rows scrolled out of view are marked", async () => {
   const reply = await tools.call("qml_snapshot", {});
-  assert.match(lineWith(reply, "0-MenuItem"), /StatusNavigationListItem "Profile" objectName=0-MenuItem$/);
+  assert.match(lineWith(reply, "0-MenuItem"), /StatusNavigationListItem "Profile" objectName=\"0-MenuItem\"$/);
   assert.ok(!text(reply).includes("_sensor"));
-  assert.match(lineWith(reply, "11-MenuItem"), /"About" objectName=11-MenuItem \(not in view\)/);
+  assert.match(lineWith(reply, "11-MenuItem"), /"About" objectName=\"11-MenuItem\" \(not in view\)/);
 });
 
 test("snapshot: with a modal popup open, only the popup is listed", async () => {
   openModal();
   const reply = await tools.call("qml_snapshot", {});
   assert.match(text(reply), /Modal popup is open: AddAccountPopup "Add a new account"/);
-  assert.match(lineWith(reply, "headerCloseButton"), /icon=close/);
+  assert.match(lineWith(reply, "headerCloseButton"), /icon=\"close\"/);
   assert.ok(!text(reply).includes("btnSave"));
 });
 
@@ -194,7 +205,7 @@ test("snapshot: a large screen is cut at the limit, with a note on how to narrow
 
 test("list_interactive keeps its name and gives the compact list without plain texts", async () => {
   const reply = await tools.call("qml_list_interactive", {});
-  assert.match(lineWith(reply, "objectName=btnSave"), /^\[e\d+\] StatusButton "Save" objectName=btnSave$/);
+  assert.match(lineWith(reply, "objectName=\"btnSave\""), /^\[e\d+\] StatusButton "Save" objectName=\"btnSave\"$/);
   assert.ok(!text(reply).includes("sectionTitle"));
 });
 
@@ -202,7 +213,7 @@ test("list_interactive keeps its name and gives the compact list without plain t
 
 test("click by reference clicks that object and returns what changed", async () => {
   const snap = await tools.call("qml_snapshot", {});
-  const ref = refOf(snap, "objectName=btnSave");
+  const ref = refOf(snap, "objectName=\"btnSave\"");
   fake.byName("btnSave").onClick = (f) => { f.byName("sectionTitle").identifying.text = "Saved!"; };
   const reply = await tools.call("qml_click", { ref });
   assert.equal(reply.isError, undefined, text(reply));
@@ -308,7 +319,7 @@ test("click needs exactly one way to name the target", async () => {
 
 test("click with a stale reference is an error and nothing is clicked", async () => {
   const snap = await tools.call("qml_snapshot", {});
-  const ref = refOf(snap, "objectName=btnSave");
+  const ref = refOf(snap, "objectName=\"btnSave\"");
   fake.remove(fake.byName("btnSave"));
   const reply = await tools.call("qml_click", { ref });
   assert.equal(reply.isError, true);
@@ -319,7 +330,7 @@ test("click with a stale reference is an error and nothing is clicked", async ()
 
 test("click with a reference to an element that got hidden is an error", async () => {
   const snap = await tools.call("qml_snapshot", {});
-  const ref = refOf(snap, "objectName=btnSave");
+  const ref = refOf(snap, "objectName=\"btnSave\"");
   fake.byName("btnSave").visible = false;
   const reply = await tools.call("qml_click", { ref });
   assert.equal(reply.isError, true);
@@ -486,6 +497,7 @@ test("get_properties without names is cut at the limit", async () => {
 });
 
 test("set_property and call_method take a reference, an objectId or an objectName", async () => {
+  tools = toolset({ unlimitedTools: true });
   let reply = await tools.call("qml_set_property", { objectName: "mySwitch", property: "checked", value: true });
   assert.equal(reply.isError, undefined, text(reply));
   assert.equal(fake.byName("mySwitch").props.checked, true);
@@ -499,7 +511,7 @@ test("set_property and call_method take a reference, an objectId or an objectNam
 test("find_by_property lists matches as short lines, hidden ones too, and no match is an error", async () => {
   let reply = await tools.call("qml_find_by_property", { property: "objectName", value: "btnHidden" });
   assert.equal(reply.isError, undefined, text(reply));
-  assert.match(text(reply), /\[e\d+\] StatusButton "Hidden" objectName=btnHidden \(hidden\)/);
+  assert.match(text(reply), /\[e\d+\] StatusButton "Hidden" objectName=\"btnHidden\" \(hidden\)/);
   reply = await tools.call("qml_find_by_property", { property: "objectName", value: "noSuchThing" });
   assert.equal(reply.isError, true);
 });
@@ -516,13 +528,66 @@ test("find_by_type is cut at the limit with a note", async () => {
   assert.match(text(reply), /not shown/);
 });
 
-test("evaluate and get_tree are cut at the limit", async () => {
+test("get_tree over the limit: the first text block is complete JSON to a smaller depth, the second says what was cut", async () => {
+  const reply = await tools.call("qml_get_tree", { depth: 50 });
+  assert.equal(reply.isError, undefined, text(reply));
+  assert.ok(text(reply).length <= MAX_REPLY_CHARS);
+  assert.equal(reply.content.length, 2);
+  const tree = JSON.parse(reply.content[0].text).tree;
+  assert.equal(tree.objectName, "Test App");
+  // The window is there; somewhere below, children were left out and their number is kept.
+  assert.equal(tree.children[0].objectName, "mainWindow");
+  const cutNodes = [];
+  const visit = (n) => { if (!n.children && n.childCount > 0) cutNodes.push(n); (n.children || []).forEach(visit); };
+  visit(tree);
+  assert.ok(cutNodes.length > 0);
+  assert.match(reply.content[1].text, /^Cut: the tree is shown to depth \d+ of \d+/);
+  assert.match(reply.content[1].text, /objectId/);
+});
+
+test("get_tree under the limit is the reply of the plugin as JSON, in one block", async () => {
+  const reply = await tools.call("qml_get_tree", { objectId: fake.byName("btnSave").id, depth: 5 });
+  assert.equal(reply.content.length, 1);
+  const tree = JSON.parse(reply.content[0].text).tree;
+  assert.equal(tree.objectName, "btnSave");
+  assert.equal(tree.children.length, 2);
+});
+
+test("evaluate over the limit is an error that says the expression ran; no cut JSON is returned", async () => {
+  tools = toolset({ unlimitedTools: true });
   fake.evaluateResult = "y".repeat(50000);
-  let reply = await tools.call("qml_evaluate", { expression: "big" });
+  const big = await tools.call("qml_evaluate", { expression: "big" });
+  assert.equal(big.isError, true);
+  assert.match(text(big), /was evaluated/);
+  assert.match(text(big), /not shown/);
+  assert.ok(!text(big).includes("yyyy"));
+  fake.evaluateResult = { answer: 42 };
+  const small = await tools.call("qml_evaluate", { expression: "small" });
+  assert.deepEqual(JSON.parse(text(small)).result, { answer: 42 });
+});
+
+test("list_file_dialogs over the limit is complete JSON too", async () => {
+  const dialog = (k) => ({ id: String(9000 + k), type: "QQuickFileDialog", objectName: `dialog${k}`, visible: false,
+                           children: Array.from({ length: 80 }, (_, c) => ({ id: `${k}-${c}`, type: "QQuickItem", objectName: "x".repeat(60), children: [] })) });
+  fake.handle = ((original) => (command, params) => (command === "listFileDialogs" ? { dialogs: [dialog(1), dialog(2)], count: 2 } : original(command, params)))(fake.handle.bind(fake));
+  const reply = await tools.call("qml_list_file_dialogs", {});
   assert.ok(text(reply).length <= MAX_REPLY_CHARS);
-  assert.match(text(reply), /cut/);
-  reply = await tools.call("qml_get_tree", { depth: 50 });
-  assert.ok(text(reply).length <= MAX_REPLY_CHARS);
+  const parsed = JSON.parse(reply.content[0].text);
+  assert.deepEqual(parsed.dialogs.map((d) => [d.objectName, d.childCount]), [["dialog1", 80], ["dialog2", 80]]);
+  assert.match(reply.content[1].text, /^Cut: the list of dialogs/);
+});
+
+test("get_properties with details gives types, writability and methods", async () => {
+  fake.byName("mySwitch").methods.toggle = () => null;
+  const plain = await tools.call("qml_get_properties", { objectName: "mySwitch", names: ["checked", "width"] });
+  assert.match(text(plain), /^checked = false$/m);
+  assert.doesNotMatch(text(plain), /Methods/);
+  const reply = await tools.call("qml_get_properties", { objectName: "mySwitch", names: ["checked", "width"], details: true });
+  assert.equal(reply.isError, undefined, text(reply));
+  assert.match(text(reply), /^checked: bool = false$/m);
+  assert.match(text(reply), /^width: double = 60 \(read-only\)$/m);
+  assert.match(text(reply), /^Methods: 1$/m);
+  assert.match(text(reply), /^method toggle\(\)$/m);
 });
 
 test("screenshot is unchanged: it returns the image", async () => {
@@ -561,14 +626,15 @@ test("an unknown tool and a missing app are errors with a plain message", async 
   await fake.listen();
 });
 
-test("the tool list keeps every old tool name, adds three, and each has a description and a schema", () => {
+test("the tool list: every old tool name that is on by default, three new ones, each with a description and a schema", () => {
   const names = tools.definitions.map((t) => t.name);
   for (const name of ["qml_find_and_click", "qml_list_interactive", "qml_screenshot", "qml_find_by_type", "qml_find_by_property", "qml_click",
-                      "qml_send_keys", "qml_get_properties", "qml_set_property", "qml_call_method", "qml_evaluate", "qml_get_tree",
+                      "qml_send_keys", "qml_get_properties", "qml_get_tree",
                       "qml_list_file_dialogs", "qml_file_dialog_action", "qml_snapshot", "qml_wait_for", "qml_scroll"]) {
     assert.ok(names.includes(name), `${name} is missing`);
   }
-  assert.equal(names.length, 17);
+  assert.equal(names.length, 14);
+  assert.equal(toolset({ unlimitedTools: true }).definitions.length, 17);
   for (const t of tools.definitions) {
     assert.ok(t.description.length > 20, t.name);
     assert.equal(t.inputSchema.type, "object", t.name);
@@ -576,3 +642,5 @@ test("the tool list keeps every old tool name, adds three, and each has a descri
   const click = tools.definitions.find((t) => t.name === "qml_click");
   for (const p of ["x", "y", "objectId", "ref", "objectName", "text"]) assert.ok(p in click.inputSchema.properties, p);
 });
+
+}); // each plugin

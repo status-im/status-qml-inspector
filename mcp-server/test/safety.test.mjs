@@ -15,6 +15,7 @@ const LIST = ["QQuickListView", "QQuickItemView", "QQuickFlickable", ...ITEM];
 const CHANGING = ["setProperty", "callMethod", "evaluate", "click", "mouse", "sendKeys", "wheel", "findAndClick", "fileDialogAction"];
 
 let fake, bridge;
+const TOKEN = "s3cret-of-16-chars"; // the plugin and the server take no token shorter than 16 characters
 
 function buildApp() {
   const rows = Array.from({ length: 12 }, (_, k) =>
@@ -156,10 +157,21 @@ test("qml_scroll changes nothing on an object that is not a list", async () => {
   assert.equal(fake.commands("setProperty").length, 0);
 });
 
-test("qml_scroll sets only contentY and contentX", async () => {
+test("qml_scroll sets contentY or contentX of the list and nothing else", async () => {
   const tools = await start();
-  await tools.call("qml_scroll", { objectName: "settingsList", y: 100, x: 0, property: "visible", value: false });
-  for (const c of fake.commands("setProperty")) assert.ok(["contentY", "contentX"].includes(c.params.property), c.params.property);
+  await tools.call("qml_scroll", { objectName: "settingsList", y: 100 });
+  const list = fake.byName("settingsList");
+  assert.deepEqual(fake.commands("setProperty").map((c) => c.params), [{ objectId: list.id, property: "contentY", value: 100 }]);
+  await tools.call("qml_scroll", { objectName: "settingsList", x: 0 });
+  assert.deepEqual(fake.commands("setProperty").map((c) => c.params.property), ["contentY", "contentX"]);
+});
+
+test("qml_scroll with an argument it does not know (a property to set) is refused, and nothing is sent", async () => {
+  const tools = await start();
+  const reply = await tools.call("qml_scroll", { objectName: "settingsList", y: 100, property: "visible", value: false });
+  assert.equal(reply.isError, true);
+  assert.match(text(reply), /no argument "property"/);
+  assert.equal(fake.log.length, 0);
 });
 
 test("no tool text points an agent to a tool that is off", async () => {
@@ -173,47 +185,61 @@ test("no tool text points an agent to a tool that is off", async () => {
 
 // ---- annotations
 
-const READ_ONLY = ["qml_snapshot", "qml_list_interactive", "qml_screenshot", "qml_wait_for", "qml_find_by_type",
-                   "qml_find_by_property", "qml_get_properties", "qml_get_tree", "qml_list_file_dialogs"];
-
-test("every tool has annotations, and the read-only tools are exactly the expected ones", async () => {
-  const tools = await start({ toolset: { unlimitedTools: true } });
-  const readOnly = [];
-  for (const t of tools.definitions) {
-    const a = t.annotations;
-    assert.ok(a, `${t.name} has no annotations`);
-    assert.equal(typeof a.title, "string", t.name);
-    assert.equal(typeof a.readOnlyHint, "boolean", t.name);
-    assert.equal(a.openWorldHint, false, t.name);
-    if (a.readOnlyHint) readOnly.push(t.name);
-    else {
-      assert.equal(typeof a.destructiveHint, "boolean", t.name);
-      assert.equal(typeof a.idempotentHint, "boolean", t.name);
-    }
-  }
-  assert.deepEqual(readOnly.sort(), [...READ_ONLY].sort());
-  const by = Object.fromEntries(tools.definitions.map((t) => [t.name, t.annotations]));
-  for (const name of ["qml_click", "qml_find_and_click", "qml_send_keys", "qml_file_dialog_action", ...UNLIMITED_TOOLS]) {
-    assert.equal(by[name].destructiveHint, true, name);
-  }
-  assert.equal(by.qml_scroll.destructiveHint, false);
-  assert.equal(by.qml_scroll.idempotentHint, true);
-});
-
-test("a tool marked read-only sends no command that changes the app", async () => {
-  const tools = await start({ toolset: { unlimitedTools: true } });
+// A valid call of every tool, for the checks of what a tool sends to the app.
+function validCalls() {
   const save = fake.byName("btnSave");
-  const args = {
-    qml_snapshot: {}, qml_list_interactive: {}, qml_screenshot: {}, qml_wait_for: { text: "Save", timeoutMs: 200 },
+  return {
+    qml_snapshot: {}, qml_list_interactive: {}, qml_screenshot: {}, qml_wait_for: { text: "Save", timeout_ms: 200 },
     qml_find_by_type: { typeName: "Button" }, qml_find_by_property: { property: "text", value: "Save" },
     qml_get_properties: { objectId: save.id }, qml_get_tree: { depth: 2 }, qml_list_file_dialogs: {},
+    qml_click: { objectName: "btnSave" }, qml_find_and_click: { text: "Save" }, qml_send_keys: { key: "Escape" },
+    qml_scroll: { objectName: "settingsList", y: 100 }, qml_file_dialog_action: { objectId: save.id, action: "cancel" },
+    qml_set_property: { objectId: save.id, property: "text", value: "x" }, qml_call_method: { objectId: save.id, method: "doIt" },
+    qml_evaluate: { expression: "1" },
   };
-  for (const name of READ_ONLY) {
-    const reply = await tools.call(name, args[name]);
-    assert.notEqual(reply.isError, true, `${name}: ${text(reply)}`);
+}
+
+test("readOnlyHint is true exactly for the tools that send no changing command to the app", async () => {
+  const tools = await start({ toolset: { unlimitedTools: true } });
+  fake.handle = ((original) => (command, params) => (command === "fileDialogAction" ? (fake.log.push({ command, params }), { done: true }) : original(command, params)))(fake.handle.bind(fake));
+  const calls = validCalls();
+  assert.deepEqual(Object.keys(calls).sort(), names(tools).sort(), "a tool has no valid call in this test");
+  for (const t of tools.definitions) {
+    fake.log.length = 0;
+    const reply = await tools.call(t.name, calls[t.name]);
+    assert.notEqual(reply.isError, true, `${t.name}: ${text(reply)}`);
+    const changing = fake.log.filter((e) => CHANGING.includes(e.command)).map((e) => e.command);
+    assert.equal(t.annotations.readOnlyHint, changing.length === 0, `${t.name} sent ${JSON.stringify(changing)} and has readOnlyHint ${t.annotations.readOnlyHint}`);
   }
-  const changing = fake.log.filter((e) => CHANGING.includes(e.command));
-  assert.deepEqual(changing, []);
+});
+
+test("every tool has a title and complete hints; destructive and open-world are set as the README says", async () => {
+  const tools = await start({ toolset: { unlimitedTools: true } });
+  const by = Object.fromEntries(tools.definitions.map((t) => [t.name, t.annotations]));
+  for (const [name, a] of Object.entries(by)) {
+    assert.ok(a && typeof a.title === "string" && a.title, `${name} has no title`);
+    assert.equal(typeof a.readOnlyHint, "boolean", name);
+    assert.equal(typeof a.openWorldHint, "boolean", name);
+    if (!a.readOnlyHint) {
+      assert.equal(typeof a.destructiveHint, "boolean", name);
+      assert.equal(typeof a.idempotentHint, "boolean", name);
+    }
+  }
+  // Input goes to an app that can send messages and payments: it can delete, and it reaches other people.
+  for (const name of ["qml_click", "qml_find_and_click", "qml_send_keys", ...UNLIMITED_TOOLS]) {
+    assert.equal(by[name].destructiveHint, true, name);
+    assert.equal(by[name].openWorldHint, true, name);
+  }
+  // What is on the screen can be written by other people.
+  for (const name of ["qml_snapshot", "qml_list_interactive", "qml_screenshot", "qml_wait_for", "qml_find_by_type", "qml_find_by_property", "qml_get_properties", "qml_get_tree", "qml_scroll"]) {
+    assert.equal(by[name].openWorldHint, true, name);
+  }
+  // File dialogs are about local files.
+  assert.equal(by.qml_list_file_dialogs.openWorldHint, false);
+  assert.equal(by.qml_file_dialog_action.openWorldHint, false);
+  assert.equal(by.qml_file_dialog_action.destructiveHint, true);
+  assert.equal(by.qml_scroll.destructiveHint, false);
+  assert.equal(by.qml_scroll.idempotentHint, true);
 });
 
 test("index.mjs sends the annotations to the client", async () => {
@@ -223,32 +249,52 @@ test("index.mjs sends the annotations to the client", async () => {
     assert.equal(by.qml_snapshot.readOnlyHint, true);
     assert.equal(by.qml_click.readOnlyHint, false);
     assert.equal(by.qml_click.destructiveHint, true);
+    assert.equal(by.qml_click.openWorldHint, true);
+    assert.equal(by.qml_list_file_dialogs.openWorldHint, false);
+    for (const t of tools) assert.equal(t.inputSchema.additionalProperties, false, t.name);
   });
 });
 
 // ---- token
 
-test("a plugin with a token refuses a client that sends none, and closes the connection", async () => {
-  const tools = await start({}, { token: "s3cret" });
+test("without a token the server says which variable to set, drops the connection and sends nothing more", async () => {
+  const tools = await start({}, { token: TOKEN });
   const reply = await tools.call("qml_snapshot", {});
   assert.equal(reply.isError, true);
-  assert.match(text(reply), /token/i);
+  assert.match(text(reply), /the plugin asks for a token/);
   assert.match(text(reply), /QML_INSPECTOR_TOKEN/);
-  assert.equal(fake.log.length, 0, "a command was run without the token");
+  // The server stopped at the first refusal: one request, no retries, and its side of the connection is closed.
+  assert.equal(fake.requests.length, 1);
+  assert.equal(bridge.socket, null);
+});
+
+test("with a token, the token check is the first line on every connection and the token is in no other request", async () => {
+  const tools = await start({ bridge: { token: TOKEN } }, { token: TOKEN });
+  await tools.call("qml_snapshot", {});
+  await tools.call("qml_click", { objectName: "btnSave" });
+  assert.deepEqual(fake.requests[0], { id: fake.requests[0].id, command: "auth", params: { token: TOKEN } });
+  assert.ok(fake.requests.length > 3);
+  for (const request of fake.requests.slice(1)) assert.ok(!JSON.stringify(request).includes(TOKEN), request.command);
+});
+
+test("without a token, no token check is sent", async () => {
+  const tools = await start();
+  await tools.call("qml_snapshot", {});
+  assert.equal(fake.requests.filter((r) => r.command === "auth").length, 0);
 });
 
 test("a plugin with a token refuses a wrong token", async () => {
-  const tools = await start({ bridge: { token: "wrong" } }, { token: "s3cret" });
+  const tools = await start({ bridge: { token: "wrong" } }, { token: TOKEN });
   const reply = await tools.call("qml_snapshot", {});
   assert.equal(reply.isError, true);
   assert.match(text(reply), /QML_INSPECTOR_TOKEN/);
-  assert.ok(!text(reply).includes("s3cret"));
+  assert.ok(!text(reply).includes(TOKEN));
   assert.ok(!text(reply).includes("wrong"), "the reply shows the token");
   assert.equal(fake.log.length, 0);
 });
 
 test("with the right token the tools work, also after the connection was lost", async () => {
-  const tools = await start({ bridge: { token: "s3cret" } }, { token: "s3cret" });
+  const tools = await start({ bridge: { token: TOKEN } }, { token: TOKEN });
   assert.match(text(await tools.call("qml_snapshot", {})), /btnSave/);
   for (const s of fake.sockets) s.destroy();
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -256,13 +302,16 @@ test("with the right token the tools work, also after the connection was lost", 
   assert.equal(fake.auths, 2);
 });
 
-test("a client with a token works with a plugin that asks for none", async () => {
-  const tools = await start({ bridge: { token: "s3cret" } });
-  assert.match(text(await tools.call("qml_snapshot", {})), /btnSave/);
+test("a client with a token does not go on with a plugin that asks for none", async () => {
+  const tools = await start({ bridge: { token: TOKEN } });
+  const reply = await tools.call("qml_snapshot", {});
+  assert.equal(reply.isError, true);
+  assert.match(text(reply), /the app was started without a token/);
+  assert.equal(fake.commands("getTree").length, 0);
 });
 
 test("a client with a token says so when the plugin is too old to check it", async () => {
-  const tools = await start({ bridge: { token: "s3cret" } }, { oldPlugin: true });
+  const tools = await start({ bridge: { token: TOKEN } }, { oldPlugin: true });
   const reply = await tools.call("qml_snapshot", {});
   assert.equal(reply.isError, true);
   assert.match(text(reply), /does not know the token check/);
@@ -270,12 +319,12 @@ test("a client with a token says so when the plugin is too old to check it", asy
 });
 
 test("index.mjs takes the token from QML_INSPECTOR_TOKEN", async () => {
-  await overStdio({ fake: { token: "s3cret" }, vars: { QML_INSPECTOR_TOKEN: "s3cret" } }, async (client) => {
+  await overStdio({ fake: { token: TOKEN }, vars: { QML_INSPECTOR_TOKEN: TOKEN } }, async (client) => {
     const snap = await client.callTool({ name: "qml_snapshot", arguments: {} });
     assert.match(snap.content[0].text, /btnSave/);
   });
   await fake.close();
-  await overStdio({ fake: { token: "s3cret" } }, async (client) => {
+  await overStdio({ fake: { token: TOKEN } }, async (client) => {
     const snap = await client.callTool({ name: "qml_snapshot", arguments: {} });
     assert.equal(snap.isError, true);
     assert.match(snap.content[0].text, /QML_INSPECTOR_TOKEN/);
