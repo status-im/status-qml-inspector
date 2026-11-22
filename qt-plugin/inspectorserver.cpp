@@ -4,6 +4,7 @@
 #include <QTcpSocket>
 #include <QJsonDocument>
 #include <QSet>
+#include <QCryptographicHash>
 #include <QWidget>
 #include <QWindow>
 #include <QQuickItem>
@@ -57,6 +58,32 @@ InspectorServer::~InspectorServer()
     stop();
 }
 
+// A line longer than this from a client that has not sent the token is dropped
+// with the connection, so that such a client cannot fill the memory.
+static const int kMaxLineBeforeAuth = 4096;
+
+// Compares in the same time whatever the two values are: the digests have one
+// length, and every byte of them is looked at.
+static bool sameToken(const QByteArray &expected, const QByteArray &given)
+{
+    const QByteArray a = QCryptographicHash::hash(expected, QCryptographicHash::Sha256);
+    const QByteArray b = QCryptographicHash::hash(given, QCryptographicHash::Sha256);
+    uchar diff = 0;
+    for (int i = 0; i < a.size(); ++i)
+        diff |= uchar(a.at(i)) ^ uchar(b.at(i));
+    return diff == 0;
+}
+
+void InspectorServer::setAuthToken(const QByteArray &token)
+{
+    m_authToken = token;
+}
+
+int InspectorServer::port() const
+{
+    return m_server ? m_server->serverPort() : 0;
+}
+
 void InspectorServer::setRootWidget(QWidget *widget)
 {
     m_root = widget;
@@ -87,6 +114,10 @@ void InspectorServer::start(int port)
 
     qInfo() << "[QmlInspector] Inspector server listening on port"
             << m_server->serverPort();
+    if (m_authToken.isEmpty())
+        qWarning("[QmlInspector] No QML_INSPECTOR_TOKEN: every program on this device can send commands");
+    else
+        qInfo("[QmlInspector] Clients must send the token first");
 }
 
 void InspectorServer::stop()
@@ -96,6 +127,7 @@ void InspectorServer::stop()
             client->disconnectFromHost();
         m_clients.clear();
         m_buffers.clear();
+        m_authenticated.clear();
         m_server->close();
         delete m_server;
         m_server = nullptr;
@@ -112,6 +144,7 @@ InspectorServer* InspectorServer::attach(QObject *root, int port)
 
     auto *inspector = new InspectorServer(root);
     inspector->setRootObject(root);
+    inspector->setAuthToken(qgetenv("QML_INSPECTOR_TOKEN").trimmed());
     inspector->start(port);
     return inspector;
 }
@@ -216,9 +249,16 @@ void InspectorServer::onReadyRead()
 
     m_buffers[socket].append(socket->readAll());
 
+    const bool needsToken = !m_authToken.isEmpty();
+
     // Process newline-delimited JSON messages
     while (true) {
+        const bool authenticated = !needsToken || m_authenticated.contains(socket);
         int idx = m_buffers[socket].indexOf('\n');
+        if (!authenticated && (idx < 0 ? m_buffers[socket].size() : idx) > kMaxLineBeforeAuth) {
+            refuse(socket, -1, QStringLiteral("Authentication required: send the auth command with the token first"));
+            return;
+        }
         if (idx < 0) break;
 
         QByteArray line = m_buffers[socket].left(idx).trimmed();
@@ -236,6 +276,31 @@ void InspectorServer::onReadyRead()
         }
 
         QJsonObject request = doc.object();
+
+        // The token check. It is here and not in handleCommand, because it belongs
+        // to the connection: the relay client has its own check.
+        if (request.value("command").toString() == QLatin1String("auth")) {
+            const int id = request.value("id").toInt(-1);
+            const QByteArray given = request.value("params").toObject().value("token").toString().toUtf8();
+            if (needsToken && !sameToken(m_authToken, given)) {
+                qWarning("[QmlInspector] A client sent a wrong token; connection closed");
+                refuse(socket, id, QStringLiteral("Authentication failed: wrong token"));
+                return;
+            }
+            m_authenticated.insert(socket);
+            QJsonObject reply = okResult({{"auth", needsToken ? "accepted" : "not required"}});
+            if (id >= 0)
+                reply["id"] = id;
+            sendResponse(socket, reply);
+            continue;
+        }
+        if (!authenticated) {
+            qWarning("[QmlInspector] A client sent a command without the token; connection closed");
+            refuse(socket, request.value("id").toInt(-1),
+                   QStringLiteral("Authentication required: send the auth command with the token first"));
+            return;
+        }
+
         QJsonObject response = handleCommand(request);
         sendResponse(socket, response);
     }
@@ -248,8 +313,20 @@ void InspectorServer::onClientDisconnected()
 
     m_clients.removeAll(socket);
     m_buffers.remove(socket);
+    m_authenticated.remove(socket);
     socket->deleteLater();
     qInfo() << "[QmlInspector] Client disconnected";
+}
+
+// One error line, then the connection is closed. Nothing more is read from it.
+void InspectorServer::refuse(QTcpSocket *socket, int id, const QString &message)
+{
+    QJsonObject reply = errorResult(message);
+    if (id >= 0)
+        reply["id"] = id;
+    m_buffers[socket].clear();
+    sendResponse(socket, reply);
+    socket->disconnectFromHost();
 }
 
 void InspectorServer::sendResponse(QTcpSocket *socket, const QJsonObject &response)

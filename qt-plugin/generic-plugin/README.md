@@ -25,7 +25,7 @@ cmake --build build
 
 Result: `build/plugins/generic/libqmlinspector.so`.
 
-Unit tests (the rule for the relay address):
+Unit tests (the rule for the relay address, and the token check of the listening server):
 
 ```bash
 cmake -S qt-plugin/generic-plugin/tests -B build-tests -G Ninja \
@@ -47,6 +47,14 @@ QT_QPA_GENERIC_PLUGINS=qmlinspector:<port> \
 It then listens on `127.0.0.1:<port>` (default 3768). Without
 `STATUS_RUNTIME_TEST_MODE=1` it does nothing.
 
+With `QML_INSPECTOR_TOKEN=<secret>` the plugin asks every connection for this
+secret. The first line of a connection must be
+`{"id": 1, "command": "auth", "params": {"token": "<secret>"}}`. A connection
+that sends another command first, or a wrong token, gets one error line and is
+closed. Without the variable there is no check: every program on the device can
+send commands, and the plugin writes a warning to the log. Use a new random
+value for each session.
+
 Desktop only: `QML_INSPECTOR_ALLOW=1` starts it without test mode. Use it for
 tests of behaviour that test mode turns off, such as automatic login. An
 Android build ignores this variable.
@@ -58,6 +66,7 @@ JSON line comes back, with the same `id` and either the result or `"error"`.
 
 | Command | What it does |
 |---|---|
+| `auth` | Sends the token (see Run). Needed first when the app has `QML_INSPECTOR_TOKEN`. |
 | `getTree` | The object tree under an object, to a given depth. |
 | `getProperties` | All properties of an object. Enums are numbers. An object-valued property is `{"objectRef": <id>, "type": ...}`. |
 | `findByType` | Objects whose type or any base type contains a name. |

@@ -8,6 +8,8 @@
 #include <QJsonValue>
 #include <QMap>
 #include <QList>
+#include <QSet>
+#include <QByteArray>
 
 #include <functional>
 
@@ -33,9 +35,18 @@ public:
     void start(int port);
     void stop();
 
+    /// A secret that a client must send before any other command, as
+    /// {"command": "auth", "params": {"token": "..."}}. A connection that sends
+    /// anything else first, or a wrong token, gets one error line and is closed.
+    /// Empty (the default) means no check. Set it before start().
+    void setAuthToken(const QByteArray &token);
+    /// The port the server listens on, 0 when it is not started.
+    int port() const;
+
     /// One-liner: attach to a root and start on the given port.
     /// root may be a QWidget, a QWindow, any QObject, or nullptr (see setRootObject).
     /// If port == 0, reads QML_INSPECTOR_PORT env var (default 3768).
+    /// Reads the token from the QML_INSPECTOR_TOKEN env var (see setAuthToken).
     static InspectorServer* attach(QObject *root, int port = 0);
 
     /// Runs one request ({"id", "command", "params"}) and returns its reply.
@@ -95,10 +106,13 @@ private:
     QJsonArray findByType(const QString &typeName, QObject *root);
 
     void sendResponse(QTcpSocket *socket, const QJsonObject &response);
+    void refuse(QTcpSocket *socket, int id, const QString &message);
 
     QTcpServer *m_server = nullptr;
     QList<QTcpSocket*> m_clients;
     QMap<QTcpSocket*, QByteArray> m_buffers;
+    QByteArray m_authToken;
+    QSet<QTcpSocket*> m_authenticated;
 
     QPointer<QObject> m_root;
 
