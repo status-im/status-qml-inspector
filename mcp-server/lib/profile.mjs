@@ -15,6 +15,7 @@ const KEYS = {
   iconNames: "list",          // objectName of the icon inside a control; the first group is shown as icon="..."
   controlTypes: "list",       // more type names that are controls
   inputWrapperTypes: "list",  // more type names that wrap a text editor
+  textTypes: "list",          // type names of items that draw a text themselves (not a Qt Quick Text); the whole name
   itemDrawers: "boolean",     // the app has a drawer that is a plain item (not Qt Quick Drawer), see the README
 };
 
@@ -43,6 +44,7 @@ export function compileProfile(data = {}) {
     iconNames: (data.iconNames || []).map((p) => regex(`^(?:${p})$`, "", `iconNames "${p}"`)),
     control: regex(anyOf([...CONTROL_TYPES, ...(data.controlTypes || [])]), "i", "controlTypes"),
     inputWrapper: regex(anyOf([...INPUT_WRAPPER_TYPES, ...(data.inputWrapperTypes || [])]), "i", "inputWrapperTypes"),
+    text: (data.textTypes || []).length ? regex(`^(?:${anyOf(data.textTypes)})$`, "", "textTypes") : null,
     itemDrawers: data.itemDrawers === true,
   };
 }

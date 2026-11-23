@@ -8,5 +8,6 @@
   "iconNames": ["(.*)-icon"],
   "controlTypes": ["ListItem"],
   "inputWrapperTypes": ["SearchBox"],
+  "textTypes": ["ChatTextItem"],
   "itemDrawers": true
 }

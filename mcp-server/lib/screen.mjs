@@ -15,7 +15,7 @@ const isItem = (n) => !!n.geometry && !isWindow(n);
 const isEditor = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QQuickTextEdit");
 // The Qt fields that can hide what is typed (echoMode).
 export const isEchoField = (n) => inherits(n, "QQuickTextInput") || inherits(n, "QLineEdit");
-const isText = (n) => inherits(n, "QQuickText");
+const isQtText = (n) => inherits(n, "QQuickText");
 const isMouseArea = (n) => inherits(n, "QQuickMouseArea");
 // Parts of a control (its background, its indicator) carry the control's word in their type name.
 const PART = /Cursor|(Background|Indicator|Icon|Loader|Text|Content|Label|Panel)$/;
@@ -138,6 +138,8 @@ export async function readScreen(bridge, known = new Map(), { profile = GENERIC_
 async function interpret(bridge, reply, known, profile, light, settled) {
 
   const isStrong = (n) => !PART.test(shortType(n.type)) && (profile.control.test(shortType(n.type)) || (n.inherits || []).some((t) => profile.control.test(t)));
+  // A text of the screen: a Qt Quick Text, or an item of a type that the profile names (it draws its text itself).
+  const isText = (n) => isQtText(n) || (!!profile.text && typeof n.text === "string" && (profile.text.test(shortType(n.type)) || (n.inherits || []).some((t) => profile.text.test(t))));
   const isPartName = (name) => !!name && !!profile.partName && profile.partName.test(name);
   const iconOf = (name) => {
     for (const pattern of profile.iconNames) {

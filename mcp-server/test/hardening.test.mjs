@@ -345,6 +345,45 @@ describe("profiles", () => {
     assert.match(lineWith(snap, "Row title"), /^\[e\d+\] FancyListItem "Row title" objectName="row"$/);
   });
 
+  // An item that draws its text itself: it has a "text" but is not a Qt Quick Text.
+  const chatApp = () => windowOf([
+    node("QQuickText", { inherits: TEXT, text: "alice", w: 100, h: 20 }),
+    node("ChatTextItem", { inherits: ITEM, objectName: "StatusTextMessage_chatText", text: "the answer is walnut 131", y: 30, w: 300, h: 20 }),
+    node("FancyPanel_QMLTYPE_2", { inherits: ITEM, objectName: "panel", text: "not a text of the screen", y: 60, w: 300, h: 20 }),
+  ]);
+
+  test("without a profile, an item of an unknown type with a text is not listed", async () => {
+    const tools = await start(chatApp().root);
+    const snap = await tools.call("qml_snapshot", {});
+    assert.notEqual(lineWith(snap, "alice"), undefined);
+    assert.equal(lineWith(snap, "walnut"), undefined);
+  });
+
+  test("with the status profile, the text of a chat message is listed and can be waited for", async () => {
+    const tools = await start(chatApp().root, { toolset: { profile: loadProfile("status") } });
+    const snap = await tools.call("qml_snapshot", {});
+    assert.match(lineWith(snap, "walnut"), /"the answer is walnut 131"/);
+    assert.equal(lineWith(snap, "not a text of the screen"), undefined);
+    const waited = await tools.call("qml_wait_for", { text: "walnut 131", timeout_ms: 1000 });
+    assert.notEqual(waited.isError, true);
+  });
+
+  test("a text type of the profile counts as the text of the control around it", async () => {
+    const { root } = windowOf([
+      node("FancyListItem_QMLTYPE_1", { inherits: ITEM, objectName: "row", w: 300, h: 40 }, [
+        node("ChatTextItem", { inherits: ITEM, text: "Row from a drawn text", w: 300, h: 20 }),
+      ]),
+    ]);
+    const tools = await start(root, { toolset: { profile: loadProfile("status") } });
+    const snap = await tools.call("qml_snapshot", {});
+    assert.match(lineWith(snap, "objectName=\"row\""), /FancyListItem "Row from a drawn text"/);
+  });
+
+  test("a profile with a wrong textTypes value is refused", () => {
+    assert.throws(() => compileProfile({ textTypes: "ChatTextItem" }), /"textTypes" must be a list of texts/);
+    assert.throws(() => compileProfile({ textTypes: ["("] }), /textTypes is not a valid pattern/);
+  });
+
   test("the code of the server names no type or object of the Status app", () => {
     for (const file of ["../lib/screen.mjs", "../lib/tools.mjs", "../lib/bridge.mjs", "../lib/profile.mjs", "../index.mjs"]) {
       const source = readFileSync(new URL(file, import.meta.url), "utf8");

@@ -253,9 +253,10 @@ Choose it with `QML_INSPECTOR_PROFILE`. The profile for the Status app is `profi
 | `iconNames` | `objectName` pattern of the icon inside a control. The first group is shown as `icon="..."` for a control without text. |
 | `controlTypes` | More type names that are controls. A part of the type name is enough. |
 | `inputWrapperTypes` | More type names of the item that wraps a text editor and carries its name and label. |
+| `textTypes` | Type names of items that draw a text themselves and are not a Qt Quick `Text` (in the Status app: the text of a chat message). The whole type name must match. Their `text` is listed like any other text. |
 | `itemDrawers` | `true` when the app has a drawer that is a plain item and not a Qt Quick `Drawer`, see below. |
 
-The values of the first four keys are regular expressions. An unknown key or a wrong value stops the server at start, with a message.
+The values of the list keys are regular expressions. An unknown key or a wrong value stops the server at start, with a message.
 
 ## Tools
 
