@@ -8,7 +8,11 @@
 //          A search (findByProperty) finds it all the same.
 //   "new": the plugin with the token check and the password hiding. Its tree carries the states (checked, activeFocus, popup,
 //          scroll position), and it leaves out what password fields hold: a hidden value is null, and the reply
-//          says how many were hidden (hiddenCount), see qt-plugin/inspectorserver.cpp.
+//          says how many were hidden (hiddenCount), see qt-plugin/inspectorserver.cpp. It does so only on a connection
+//          that has sent the command "hideSecrets"; every other connection gets these texts, as from the old plugin.
+//          The old plugin does not know the command.
+//          fake.hideSecretsError: when set, the new plugin answers the command with this error.
+//          fake.hideRequests counts the commands received.
 //
 // Like the real plugin:
 //   - A click goes to a position, not to an object: when an open popup lies over the middle of the object, the popup gets
@@ -56,6 +60,9 @@ export class FakeInspector {
     this.stealPresses = 0;    // this many of the next mouse presses go to another item, as when an overlay takes the tap
     this.onStolenClick = null;
     this.plugin = "old";      // "old" or "new", see the top of this file
+    this.hiding = false;      // during a request: has its connection sent "hideSecrets" (new plugin only)
+    this.hideRequests = 0;    // "hideSecrets" commands received
+    this.hideSecretsError = null; // when set: the new plugin answers "hideSecrets" with this error
     this.connections = 0;     // sockets accepted so far
     this.requests = [];       // every request line received, the token check included
     this.splitCharacters = false; // when set, a reply is written in pieces that split its characters of several bytes
@@ -138,7 +145,8 @@ export class FakeInspector {
   serialize(n, maxDepth, depth) {
     const out = { id: n.id, type: n.type, objectName: n.objectName, inherits: n.inherits };
     const fresh = this.plugin === "new";
-    const secrets = fresh ? this.secretsNow || this.secrets() : new Set();
+    const hides = fresh && this.hiding;
+    const secrets = hides ? this.secretsNow || this.secrets() : new Set();
     // The plugin before the token check lists the child items of an item only: a popup object is not among them.
     const listed = fresh || !isItem(n) ? n.children : n.children.filter((c) => !isPopup(c));
     if (isWindow(n)) {
@@ -149,7 +157,7 @@ export class FakeInspector {
     }
     for (const [k, v] of Object.entries(n.identifying)) {
       if (v === "" || v == null) continue;
-      if (fresh && ((hidesText(n) && TYPED_TEXT.includes(k)) || secrets.has(v))) { out.secret = true; this.hiddenCount++; }
+      if (hides && ((hidesText(n) && TYPED_TEXT.includes(k)) || secrets.has(v))) { out.secret = true; this.hiddenCount++; }
       else out[k] = v;
     }
     let children = listed;
@@ -199,9 +207,10 @@ export class FakeInspector {
     this.hiddenCount = 0;
     if (this.failCommands.includes(command)) throw new Error(`${command} failed`);
     const fresh = this.plugin === "new";
-    const secrets = fresh ? this.secrets() : new Set();
+    const hides = fresh && this.hiding;   // has the connection of this request sent "hideSecrets"
+    const secrets = hides ? this.secrets() : new Set();
     this.secretsNow = secrets; // for serialize(), during this command
-    const hidden = (n, property, v) => fresh && ((hidesText(n) && TYPED_TEXT.includes(property)) || (typeof v === "string" && secrets.has(v)));
+    const hidden = (n, property, v) => hides && ((hidesText(n) && TYPED_TEXT.includes(property)) || (typeof v === "string" && secrets.has(v)));
     // As the plugin does: the text of a password field inside a list or a map is null, and it is counted.
     const count = () => { this.hiddenCount++; return null; };
     const deep = (v) => (typeof v === "string" ? (secrets.has(v) ? count() : v) : Array.isArray(v) ? v.map(deep)
@@ -357,6 +366,7 @@ export class FakeInspector {
       socket.on("close", () => this.sockets.delete(socket));
       let buffer = "";
       let authed = false;
+      let hiding = false;     // this connection has sent "hideSecrets"
       let ended = false;
       socket.on("data", (chunk) => {
         if (ended) return;
@@ -386,14 +396,24 @@ export class FakeInspector {
             continue;
           }
           let reply;
-          try {
-            reply = { ...this.handle(request.command, request.params || {}), ok: true };
-          } catch (err) {
-            reply = { error: err.message };
+          if (request.command === "hideSecrets") {
+            // The state of this connection, for as long as it lives. The old plugin does not know the command.
+            this.hideRequests++;
+            this.hiddenCount = 0;
+            if (this.plugin !== "new") reply = { error: "Unknown command: hideSecrets" };
+            else if (this.hideSecretsError) reply = { error: this.hideSecretsError };
+            else { hiding = true; reply = { ok: true }; }
+          } else {
+            this.hiding = hiding;
+            try {
+              reply = { ...this.handle(request.command, request.params || {}), ok: true };
+            } catch (err) {
+              reply = { error: err.message };
+            }
           }
           reply.id = request.id;
-          if (this.plugin === "new" && reply.ok) reply.secretsHidden = true;
-          if (this.plugin === "new" && this.hiddenCount > 0) reply.hiddenCount = this.hiddenCount;
+          if (this.plugin === "new" && hiding && reply.ok) reply.secretsHidden = true;
+          if (this.plugin === "new" && hiding && this.hiddenCount > 0) reply.hiddenCount = this.hiddenCount;
           if (this.closeAfter && this.closeAfter(request)) {
             ended = true;
             socket.end(JSON.stringify(reply) + "\n");

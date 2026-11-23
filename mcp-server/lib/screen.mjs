@@ -46,7 +46,8 @@ async function ids(bridge, property, value) {
 // ---- password fields
 //
 // What a password field holds must never reach the agent. The new plugin (the one with the password hiding, see the README) leaves these texts out
-// itself and says so in its replies (secretsHidden). For an older plugin the server finds the fields
+// itself on a connection that has asked for it (the command hideSecrets, which the bridge sends on every connection),
+// and says so in its replies (secretsHidden). For a plugin that does not say so (an older one) the server finds the fields
 // (one search for echoMode) and removes their text from the reply before anything else looks at it.
 
 export const pluginHidesSecrets = (reply) => reply && reply.secretsHidden === true;

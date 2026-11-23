@@ -90,9 +90,9 @@ The object tree includes common identifying properties (`text`, `title`, `source
 The plugin with the password hiding (a separate change, with its own PR; not in this branch until that PR is merged) adds two things to a node. Its README, `qt-plugin/generic-plugin/README.md`, describes them:
 
 - The states a client needs to list a screen: `checked`, `activeFocus`, the popup an item belongs to (`popup`, with `modal` and `opened`), and the scroll position of a list (`contentY`, `contentHeight`, `originY`, ...).
-- What a password field holds (a text field whose `echoMode` is not `Normal`) is left out of what the reading commands send: its node has `"secret": true` and `textLength` in place of `text`.
+- A password field (a text field whose `echoMode` is not `Normal`) is marked: its node has `"secret": true` and `textLength`. For a client that has sent the command `hideSecrets` on its connection, what the field holds is also left out of what the reading commands send (no `text`). Every other client gets the text.
 
-The MCP server works with both plugins. With the plugin of this branch it asks for the states itself and hides the text of password fields itself.
+The MCP server works with both plugins. With the plugin of this branch it asks for the states itself and hides the text of password fields itself. With the other plugin it sends `hideSecrets` on every connection, and the plugin hides the text.
 
 ## MCP Server
 

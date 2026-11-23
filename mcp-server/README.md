@@ -9,7 +9,7 @@ Version 2.0.0. If you used the server before, read [Changes for existing users](
 The server works with two plugins, and finds out by itself which one the app has:
 
 - **The old plugin**: the plugin in `qt-plugin/` of this branch. It can ask for a token. It sends the text of password fields, so the server hides that text itself. Its tree has no states.
-- **The new plugin**: the plugin with the password hiding. It is a separate change (its own PR) and is not in this branch. It hides the text of password fields itself, sends the states with the tree, and has the stricter token rules.
+- **The new plugin**: the plugin with the password hiding. It is a separate change (its own PR) and is not in this branch. It sends the states with the tree and has the stricter token rules. It hides the text of password fields itself for a client that asks for it (the command `hideSecrets`). The server asks on every connection, so with this plugin the plugin hides the text. No setting is needed.
 
 A part of this page that is marked **(new plugin)** describes that plugin. Until its PR is merged, such a part is not true for the plugin of this branch. Everything else holds for both.
 
@@ -145,7 +145,11 @@ This rule has a price. A reply shows whether some text of the app is hidden, so 
 
 Who hides the text:
 
-- **(new plugin)** The new plugin leaves these texts out itself, in every reply.
+- The server sends the command `hideSecrets` as the first request of every connection (after the token, when there is one), and again after every reconnect. No variable turns this off; it is the same with `QML_INSPECTOR_UNLIMITED_TOOLS=1`.
+- **(new plugin)** The plugin accepts the command and leaves these texts out itself, in every reply on this connection, and says so (`secretsHidden`).
+- The old plugin answers "Unknown command". The server then hides the texts itself, as the two points below say.
+- Any other answer, or none: the server closes the connection and the tool call fails ("the plugin did not accept the request to hide password text"). Nothing is read from the app.
+- Who gets password text: a plain client of the plugin, such as a test suite or `test-framework/framework.mjs`. It does not send the command, and a test can read back the password it typed. Who does not: an agent that works through this server.
 - With the old plugin the server looks for the password fields (one search for `echoMode`) and removes the texts before it builds the reply. If that search fails, the tool returns an error and shows nothing.
 - With the old plugin the search is a request of its own, and the app can change between the two requests. The user can type: so the server takes the text of each field also from the tree it shows. A field can go away (Return on a login page): so a text field of the tree counts as a password field unless the search has confirmed that it shows its text. For the other tools the server searches before and after the read. If the two searches differ, it reads again, 3 times at most; then it returns an error ("A password field is changing") and shows nothing.
 
@@ -295,6 +299,7 @@ Two kinds of drawer are found:
 One read of the screen is one `getTree` request. The server reads until two reads in a row are the same, so a snapshot is at least 2 reads and a click at least 4 (2 before, 2 after).
 
 - **(new plugin)** That is all. The tree carries the states (checked, focus, open popups, scroll positions).
+- One more request per connection (not per call): the command `hideSecrets`, with both plugins.
 - With the old plugin, the server asks for the states once per snapshot, for the last tree: 3 searches of the whole tree (`checked`, `activeFocus`, `modal`), 1 more when a modal popup is open, and 1 more for password fields when the screen has a text input. A click costs twice that.
 
 While the screen moves, the server sends nothing but `getTree`. It asks no single object for anything.

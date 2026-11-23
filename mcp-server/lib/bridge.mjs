@@ -125,6 +125,7 @@ export class QtBridge {
       this.connecting = this._open()
         .then(async (connection) => {
           if (this.token) await this._authenticate(connection);
+          await this._hideSecrets(connection);
           this.connection = connection;
           this.generation++;
           if (this.onConnect) this.onConnect();
@@ -185,6 +186,31 @@ export class QtBridge {
     }
     throw new Error("Cannot connect to the inspector: the plugin did not accept the token. " +
                     "QML_INSPECTOR_TOKEN must have the same value here and in the app.");
+  }
+
+  // Asks the plugin to leave what password fields hold out of its replies on this connection. It goes on every new
+  // connection, after the token and before any other request: the plugin keeps this for one connection only, and a
+  // plain client of it (a test suite) gets these texts.
+  // - ok: the plugin hides them, and says so in every reply (secretsHidden).
+  // - "Unknown command": a plugin from before this command. It sends the texts, and the server takes them out itself
+  //   (see findSecrets in screen.mjs). Nothing more is needed here: its replies have no secretsHidden.
+  // - anything else: the connection is closed and nothing is read, so that no password is shown.
+  async _hideSecrets(connection) {
+    let reply;
+    try {
+      reply = await connection.request(++this.requestId, "hideSecrets", {});
+    } catch (err) {
+      connection.destroy();
+      if (connection.reason) throw new Error(`Cannot connect to the inspector: it closed the connection (${connection.reason}).`);
+      throw new Error(`Cannot connect to the inspector: no answer to the request to hide password text (${err.message}). Nothing was read from the app, so that no password is shown.`);
+    }
+    if (!reply.error || /^unknown command/i.test(reply.error)) return;
+    connection.destroy();
+    if (/^Authentication required/.test(reply.error)) {
+      throw new Error("Cannot connect to the inspector: the plugin asks for a token. " +
+                      "Set QML_INSPECTOR_TOKEN to the value the app was started with.");
+    }
+    throw new Error(`Cannot connect to the inspector: the plugin did not accept the request to hide password text (${reply.error}). Nothing was read from the app, so that no password is shown.`);
   }
 
   async send(command, params = {}) {
