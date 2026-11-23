@@ -32,9 +32,10 @@ add_test(NAME tst_startplan COMMAND tst_startplan)
 if(TARGET Qt6::Gui AND TARGET Qt6::Qml AND TARGET Qt6::Quick AND TARGET Qt6::Widgets)
     # tst_authtoken: the token check, with the real server on a local socket.
     # tst_secrets: the text of password fields is in no reply.
+    # tst_secrets also has the relay client: the same rule for password fields holds in dial-out mode.
     foreach(name tst_authtoken tst_secrets)
-        add_executable(${name} ${name}.cpp ../../inspectorserver.h ../../inspectorserver.cpp)
-        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+        add_executable(${name} ${name}.cpp ../../inspectorserver.h ../../inspectorserver.cpp ../relayclient.h ../relayclient.cpp)
+        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../.. ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_compile_definitions(${name} PRIVATE QMLINSPECTOR_HAVE_QUICKWIDGETS=0)
         target_link_libraries(${name} PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::Widgets Qt6::Test)
         add_test(NAME ${name} COMMAND ${name})

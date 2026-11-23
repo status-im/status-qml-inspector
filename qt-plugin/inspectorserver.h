@@ -76,9 +76,18 @@ public:
     int bytesWaiting() const;
     int secretLookups() const { return m_secretLookups; }
 
-    /// Runs one request ({"id", "command", "params"}) and returns its reply.
+    /// What one client has asked for. Every connection has one of its own, and the relay client has one.
+    struct Session
+    {
+        /// Leave what password fields hold out of the replies to this client (see "Password fields" in the README
+        /// of the generic plugin). Off when a connection opens: the inspector is a tool for tests, and tests read
+        /// these fields. The command "hideSecrets" turns it on for its connection; nothing turns it off again.
+        bool hideSecrets = false;
+    };
+
+    /// Runs one request ({"id", "command", "params"}) of the client that `session` belongs to, and returns its reply.
     /// Public for the relay client, which serves commands without a socket.
-    QJsonObject handleCommand(const QJsonObject &request);
+    QJsonObject handleCommand(const QJsonObject &request, Session &session);
 
 private slots:
     void onNewConnection();
@@ -110,8 +119,9 @@ private:
     QJsonArray serializeProperties(QObject *obj);
     QJsonValue variantToJson(const QVariant &var);
 
-    // Hidden text: what a password field holds is left out of what the reading commands send (see the README
-    // for what a client that may change the app can still do).
+    // Hidden text: with the hiding on, what a password field holds is left out of what the reading commands send
+    // (see the README for what a client that may change the app can still do).
+    bool hidesTextOf(QObject *obj) const;
     void collectSecrets();
     const QSet<QString> &secrets();
     bool isSecretValue(const QVariant &value);
@@ -158,6 +168,7 @@ private:
     QSet<QTcpSocket*> m_authenticated;
     int m_authTimeoutMs = 5000;
     QSet<QString> m_secrets;
+    bool m_hideSecrets = false;
     bool m_secretsCollected = false;
     int m_secretLookups = 0;
     int m_hiddenCount = 0;      // values hidden in the reply of the command that runs

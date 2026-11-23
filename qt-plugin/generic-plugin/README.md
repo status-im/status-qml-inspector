@@ -27,7 +27,7 @@ Result: `build/plugins/generic/libqmlinspector.so`.
 
 Unit tests (the rule for the relay address, the values of a switch, what the
 plugin does when it is created, the token check of the listening server, and
-the hiding of password fields). The last two need the Qt GUI modules. Without them the configure step fails, so that a test
+password fields for a client with and without the hiding). The last two need the Qt GUI modules. Without them the configure step fails, so that a test
 run cannot pass without the two security tests. To build only the small tests
 on a machine with Qt Core alone, pass `-DQMLINSPECTOR_TESTS_WITHOUT_GUI=ON`; a
 warning then says what is left out:
@@ -112,6 +112,35 @@ set there is no token, and nothing is logged about it.
 
 ## Password fields
 
+The plugin sends what a password field holds, like any other text, unless the
+client asks it not to. It is a tool for tests, and tests read these fields: a
+test types a password and checks the field. Only the mark of the field is
+always there: in the tree, a text field with a hidden echo has
+`"secret": true`, `"textLength": <n>`, and every text field has
+`"echoMode": <number>`.
+
+A client that must not see passwords sends one command first:
+`{"id": 1, "command": "hideSecrets"}`. From this reply on, the plugin leaves
+these texts out of every reply on that connection. There is no setting for it
+in the app, and nothing to remember when the app is started:
+
+- **Who gets password text:** a plain client, such as a test suite or
+  `test-framework/framework.mjs`. It sends nothing, and reads the text.
+- **Who does not:** the MCP server. It sends the command on every connection,
+  so an AI agent that works through it gets no password text.
+- The state belongs to one connection. Two clients at the same time, one with
+  and one without, do not change each other's replies. A new connection starts
+  without it, so a client sends the command after every reconnect.
+- Nothing turns it off again on that connection, and the command takes no
+  parameter.
+- With a token, the command is accepted only after `auth`, like every command.
+- A plugin from before this command answers `Unknown command: hideSecrets`.
+- An AI agent that is connected to the plugin without the MCP server gets the
+  text unless it sends the command. Use the MCP server for agents.
+
+The rest of this section describes the replies to a client that has sent the
+command.
+
 What a text field with a hidden echo holds (`echoMode` is not `Normal`:
 `TextInput`, `TextField`, `QLineEdit`) is left out of the replies of the
 commands that read: `getTree`, `getProperties`, `findByType`, `findByProperty`,
@@ -135,7 +164,9 @@ It does not hold for a client that uses `evaluate`, `setProperty` or
   and the node has `"secret": true`.
 - `setProperty` does not set `echoMode` of a field that hides its text: it
   returns an error.
-- Every successful reply carries `"secretsHidden": true`.
+- Every successful reply carries `"secretsHidden": true`, the reply to
+  `hideSecrets` included. A client that has not sent the command gets neither
+  this nor `hiddenCount`.
 
 One form everywhere: a hidden value is `null`, or left out of a tree node that
 then has `"secret": true`. A reply in which something was hidden, or not
@@ -185,9 +216,9 @@ every command.
 The tree of a window holds the content of a closed popup only for a `Drawer`.
 For a closed dialog or menu, ask for the tree of the popup itself.
 
-A test that needs to check a typed password compares `textLength` (the number
-of UTF-16 units, as `QString::size()` gives it). This is a change for clients
-that read the text of a password field before.
+A client that has sent the command and needs to check a typed password compares
+`textLength` (the number of UTF-16 units, as `QString::size()` gives it): the
+text of the field reads as `null`.
 
 Desktop only: `QML_INSPECTOR_ALLOW=1` starts it without test mode. Use it for
 tests of behaviour that test mode turns off, such as automatic login. An
@@ -201,6 +232,7 @@ JSON line comes back, with the same `id` and either the result or `"error"`.
 | Command | What it does |
 |---|---|
 | `auth` | Sends the token (see Run). Needed first when the app has `QML_INSPECTOR_TOKEN`. |
+| `hideSecrets` | From this reply on, replies on this connection leave out what password fields hold (see Password fields). |
 | `getTree` | The object tree under an object, to a given depth. A node carries `checked` and `activeFocus` when true, `popup` (the popup an item belongs to, with `modal` and `opened`), and the scroll position of a list. A popup that is declared inside an item is listed under that item. The reply has `"states": true`. |
 | `getProperties` | All properties of an object. Enums are numbers. An object-valued property is `{"objectRef": <id>, "type": ...}`. With `"names": [...]` only these properties are read, and no method list is sent. Prefer this: reading all properties runs every getter of the object. |
 | `findByType` | Objects whose type or any base type contains a name. |
@@ -235,7 +267,10 @@ the device, such as BrowserStack Local, carries the request to the test machine.
 In this mode the plugin answers only `getTree`, `getProperties`, `findByType`
 and `findByProperty`, and returns an error for every other command: the channel
 leaves the device, so it can read state and cannot change it. Password fields
-are hidden in this mode too.
+are hidden in this mode by the same rule as for a connection: the relay sends
+`hideSecrets` (the plugin answers it too), and from then on the plugin leaves
+these texts out until the app exits. Without the command, what password
+fields hold goes to the relay.
 
 ## Source
 
@@ -244,7 +279,7 @@ are hidden in this mode too.
 see `LICENSE-MIT`). Changes: works in an application without widgets, builds
 for Android, input through Qt's test input path, the `mouse`, `wheel` and
 `geometry` commands, base-type matching, popups in the tree, the token check,
-hidden password fields, states in the tree, the rule for a token (`tokenrule.h`).
+hidden password fields (for a client that asks), states in the tree, the rule for a token (`tokenrule.h`).
 `qmlinspectorplugin.cpp` wraps the server as a plugin, so the app's own sources
 are untouched. `startplan.h` decides from the environment whether it starts. `relayclient.cpp` and `relayclient.h` are the dial-out mode and
 are not from logos-qt-mcp.

@@ -104,17 +104,23 @@ void InspectorRelayClient::onNextFinished(QNetworkReply *reply)
     }
 
     const QJsonObject command = QJsonDocument::fromJson(reply->readAll()).object();
+    postReply(QJsonDocument(run(command)).toJson(QJsonDocument::Compact));
+}
+
+QJsonObject InspectorRelayClient::run(const QJsonObject &command)
+{
     const QString name = command.value(QStringLiteral("command")).toString();
     QJsonObject result;
-    if (isReadCommand(name)) {
-        result = m_inspector->handleCommand(command);
+    // "hideSecrets" changes nothing in the app: it only makes the replies to this relay leave out password text.
+    if (isReadCommand(name) || name == QLatin1String("hideSecrets")) {
+        result = m_inspector->handleCommand(command, m_session);
     } else {
         result = QJsonObject{{QStringLiteral("error"),
                               QStringLiteral("Not available through a relay: %1").arg(name)}};
         if (command.contains(QStringLiteral("id")))
             result[QStringLiteral("id")] = command.value(QStringLiteral("id"));
     }
-    postReply(QJsonDocument(result).toJson(QJsonDocument::Compact));
+    return result;
 }
 
 void InspectorRelayClient::postReply(const QByteArray &body)

@@ -1,4 +1,6 @@
-// What a password field holds must not be in any reply of the server.
+// A client that has sent the command "hideSecrets" gets no reply that holds what a password field holds.
+// Every other client gets these texts as before: the cases "byDefault_..." check that. The state belongs to one
+// connection: the cases "twoClients_...", "overTheSocket_..." and "relay_..." check that.
 #include <QtTest>
 #include <QApplication>
 #include <QDialog>
@@ -10,8 +12,14 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QTcpSocket>
+#include <QHostAddress>
 
 #include "inspectorserver.h"
+#include "relayclient.h"
+
+// 18 characters: the server takes no token shorter than 16.
+#define TOKEN "s3cret-of-16-chars"
 
 static const char *kSecret = "hunter2-Secret!";
 
@@ -39,6 +47,23 @@ public:
     QString m_name;
 };
 
+// Its method runs a request of another client and then returns a text: a command inside a command, as when code of
+// the app that a command runs lets the server read its sockets.
+class Reentrant : public QObject
+{
+    Q_OBJECT
+public:
+    using QObject::QObject;
+    Q_INVOKABLE QString askAsOther()
+    {
+        lastReply = server->handleCommand(QJsonObject{{"id", 900}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 20}}}}, *session);
+        return QString::fromLatin1(kSecret);
+    }
+    InspectorServer *server = nullptr;
+    InspectorServer::Session *session = nullptr;
+    QJsonObject lastReply;
+};
+
 class tst_Secrets : public QObject
 {
     Q_OBJECT
@@ -47,11 +72,29 @@ private:
     QQmlEngine m_engine;
     std::unique_ptr<QObject> m_root;
     std::unique_ptr<InspectorServer> m_serverOwner;
+    // The client that ask() speaks for. init() sends "hideSecrets" for it.
+    InspectorServer::Session m_session;
     int m_id = 0;
 
     QJsonObject ask(const QString &command, const QJsonObject &params = {})
     {
-        return m_serverOwner->handleCommand(QJsonObject{{"id", ++m_id}, {"command", command}, {"params", params}});
+        return askAs(m_session, command, params);
+    }
+    QJsonObject askAs(InspectorServer::Session &session, const QString &command, const QJsonObject &params = {})
+    {
+        return m_serverOwner->handleCommand(QJsonObject{{"id", ++m_id}, {"command", command}, {"params", params}}, session);
+    }
+    // The same over a real connection. An empty object when the server sent no line.
+    QJsonObject askOver(QTcpSocket &socket, const QString &command, const QJsonObject &params = {})
+    {
+        socket.write(QJsonDocument(QJsonObject{{"id", ++m_id}, {"command", command}, {"params", params}}).toJson(QJsonDocument::Compact) + '\n');
+        (void) QTest::qWaitFor([&socket] { return socket.canReadLine() || socket.state() == QAbstractSocket::UnconnectedState; }, 3000);
+        return QJsonDocument::fromJson(socket.readLine()).object();
+    }
+    static bool connectTo(QTcpSocket &socket, int port)
+    {
+        socket.connectToHost(QHostAddress::LocalHost, port);
+        return socket.waitForConnected(2000);
     }
     static QByteArray text(const QJsonObject &reply) { return QJsonDocument(reply).toJson(); }
     QString idOf(const QString &objectName)
@@ -68,6 +111,12 @@ private:
         return {};
     }
 
+    // A client that has sent nothing yet: the hiding is off for it.
+    void useANewClient()
+    {
+        m_session = InspectorServer::Session();
+    }
+
 private slots:
     // A new scene and a new server for every test: no test depends on what another one changed.
     void cleanup()
@@ -78,6 +127,7 @@ private slots:
     void init()
     {
         m_serverOwner = std::make_unique<InspectorServer>();
+        m_session = InspectorServer::Session();
         QQmlComponent component(&m_engine);
         component.setData(R"(
             import QtQuick
@@ -117,6 +167,8 @@ private slots:
         lists->setProperty("mixed", QVariantList{1, QString(kSecret), QVariantMap{{"inner", QString(kSecret)}}});
         lists->setProperty("bytes", QByteArray(kSecret));
         lists->setProperty("plainNames", QStringList{"first", "second"});
+        // Every case runs as a client that has asked for the hiding, except those that call useANewClient().
+        QVERIFY(ask("hideSecrets").value("ok").toBool());
     }
 
     void lists_hideTheTextInsideThem()
@@ -312,7 +364,9 @@ private slots:
                                           && window->findChild<QObject*>("otherDialog")->property("opened").toBool(); }, 3000));
         InspectorServer server;
         server.setRootObject(window.get());
-        const QJsonObject tree = server.handleCommand(QJsonObject{{"id", 1}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 40}}}});
+        InspectorServer::Session session;
+        QVERIFY(server.handleCommand(QJsonObject{{"id", 1}, {"command", "hideSecrets"}}, session).value("ok").toBool());
+        const QJsonObject tree = server.handleCommand(QJsonObject{{"id", 1}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 40}}}}, session);
         QVERIFY(tree.value("ok").toBool());
         QVERIFY2(!text(tree).contains(kSecret), text(tree).constData());
         // The window says that something was left out, and the title of the other dialog is there, on its popup item.
@@ -338,7 +392,9 @@ private slots:
         shown.setText("shown in a widget");
         InspectorServer widgets;
         widgets.setRootObject(&dialog);
-        const QJsonObject widgetTree = widgets.handleCommand(QJsonObject{{"id", 1}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 5}}}});
+        InspectorServer::Session widgetSession;
+        QVERIFY(widgets.handleCommand(QJsonObject{{"id", 1}, {"command", "hideSecrets"}}, widgetSession).value("ok").toBool());
+        const QJsonObject widgetTree = widgets.handleCommand(QJsonObject{{"id", 1}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 5}}}}, widgetSession);
         QVERIFY(widgetTree.value("ok").toBool());
         QVERIFY2(!text(widgetTree).contains(kSecret), text(widgetTree).constData());
         QVERIFY(text(widgetTree).contains("shown in a widget"));
@@ -475,11 +531,12 @@ private slots:
         Counted counted;
         InspectorServer server;
         server.setRootObject(&counted);
+        InspectorServer::Session session;
         int id = 0;
         const auto ask = [&](const QJsonObject &params) {
-            return server.handleCommand(QJsonObject{{"id", ++id}, {"command", "getProperties"}, {"params", params}});
+            return server.handleCommand(QJsonObject{{"id", ++id}, {"command", "getProperties"}, {"params", params}}, session);
         };
-        const QString objectId = server.handleCommand(QJsonObject{{"id", ++id}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 0}}}})
+        const QString objectId = server.handleCommand(QJsonObject{{"id", ++id}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 0}}}}, session)
                                      .value("tree").toObject().value("id").toString();
         const QJsonObject some = ask({{"objectId", objectId}, {"names", QJsonArray{"cheap", "noSuchProperty"}}});
         const QJsonArray props = some.value("properties").toArray();
@@ -508,6 +565,265 @@ private slots:
         field->setProperty("echoMode", 0);
         QCOMPARE(property("noEcho", "text").value("value").toString(), QString("other-Secret-9"));
         QVERIFY(text(ask("getTree", {{"depth", 20}})).contains("other-Secret-9"));
+    }
+
+    // --- The default: the hiding is off, and the plugin sends what a password field holds, as it did before. ---
+
+    void byDefault_theTreeHasThePasswordText()
+    {
+        useANewClient();
+        const QJsonObject reply = ask("getTree", {{"depth", 20}});
+        QVERIFY(reply.value("ok").toBool());
+        QVERIFY(text(reply).contains(kSecret));
+        QVERIFY(text(reply).contains("other-Secret-9"));
+        // Nothing says that something was hidden: a client that hides the text itself (the MCP server) goes by this.
+        QVERIFY(!reply.contains("secretsHidden"));
+        QVERIFY(!reply.contains("hiddenCount"));
+        const QJsonObject node = ask("getTree", {{"objectId", idOf("password")}, {"depth", 0}}).value("tree").toObject();
+        QCOMPARE(node.value("text").toString(), QString(kSecret));
+        // The titles that equal the text are sent too.
+        QVERIFY(text(ask("listFileDialogs")).contains(kSecret));
+    }
+
+    // The mark of a password field stays in both modes: it changes no value.
+    void byDefault_theTreeStillMarksAPasswordField()
+    {
+        useANewClient();
+        const QJsonObject node = ask("getTree", {{"objectId", idOf("password")}, {"depth", 0}}).value("tree").toObject();
+        QCOMPARE(node.value("secret").toBool(), true);
+        QCOMPARE(node.value("textLength").toInt(), int(strlen(kSecret)));
+        QCOMPARE(node.value("echoMode").toInt(), 2);
+        // Only the field itself has the mark: a wrapper with the same text has none.
+        const QJsonObject wrapper = ask("getTree", {{"objectId", idOf("wrapper")}, {"depth", 0}}).value("tree").toObject();
+        QCOMPARE(wrapper.value("text").toString(), QString(kSecret));
+        QVERIFY(!wrapper.contains("secret"));
+        const QJsonObject plain = ask("getTree", {{"objectId", idOf("plain")}, {"depth", 0}}).value("tree").toObject();
+        QVERIFY(!plain.contains("secret"));
+    }
+
+    void byDefault_propertiesGiveThePasswordText()
+    {
+        useANewClient();
+        for (const char *name : {"text", "displayText"}) {
+            const QJsonObject p = property("password", name);
+            QVERIFY2(!p.contains("hidden"), name);
+        }
+        QCOMPARE(property("password", "text").value("value").toString(), QString(kSecret));
+        QCOMPARE(property("wrapper", "text").value("value").toString(), QString(kSecret));
+        QCOMPARE(property("lists", "names").value("value").toArray(), QJsonArray({"first", kSecret}));
+        const QJsonObject named = ask("getProperties", {{"objectId", idOf("password")}, {"names", QJsonArray{"text"}}});
+        QCOMPARE(named.value("properties").toArray().first().toObject().value("value").toString(), QString(kSecret));
+        QVERIFY(!named.contains("secretsHidden"));
+        QVERIFY(!named.contains("hiddenCount"));
+    }
+
+    void byDefault_aSearchByValueComparesThePasswordText()
+    {
+        useANewClient();
+        const QJsonObject found = ask("findByProperty", {{"property", "text"}, {"value", kSecret}});
+        // The field and its wrapper are among the matches, with the text as their value.
+        QStringList names;
+        for (const QJsonValue &match : found.value("matches").toArray()) {
+            names << match.toObject().value("objectName").toString();
+            QCOMPARE(match.toObject().value("value").toString(), QString(kSecret));
+        }
+        QVERIFY2(names.contains("password") && names.contains("wrapper"), qPrintable(names.join(',')));
+        QVERIFY(!found.contains("hiddenCount"));
+        QCOMPARE(ask("evaluate", {{"expression", "children[0].text"}}).value("result").toString(), QString(kSecret));
+    }
+
+    void byDefault_echoModeOfAPasswordFieldCanBeSet()
+    {
+        useANewClient();
+        const QJsonObject set = ask("setProperty", {{"objectId", idOf("password")}, {"property", "echoMode"}, {"value", 0}});
+        QVERIFY2(set.value("ok").toBool(), text(set).constData());
+        QCOMPARE(m_root->findChild<QObject*>("password")->property("echoMode").toInt(), 0);
+    }
+
+    void byDefault_anErrorTextOfEvaluateIsNotChanged()
+    {
+        useANewClient();
+        const QJsonObject reply = ask("evaluate", {{"expression", "(function(){ throw new Error('got ' + children[0].text + ' here'); })()"}});
+        QVERIFY2(reply.value("error").toString().contains(QString("got %1 here").arg(kSecret)), text(reply).constData());
+        QVERIFY(!reply.contains("hiddenCount"));
+    }
+
+    // With the hiding off no command walks the tree for the texts of password fields.
+    void byDefault_noCommandLooksForPasswordTexts()
+    {
+        useANewClient();
+        ask("getTree", {{"depth", 20}});
+        ask("getProperties", {{"objectId", idOf("password")}});
+        ask("listInteractive");
+        QCOMPARE(m_serverOwner->secretLookups(), 0);
+    }
+
+    // --- The command, and whose replies it changes. ---
+
+    void theCommand_turnsTheHidingOnForItsClient()
+    {
+        useANewClient();
+        QVERIFY(text(ask("getTree", {{"depth", 20}})).contains(kSecret));
+        const QJsonObject on = ask("hideSecrets");
+        QVERIFY2(on.value("ok").toBool(), text(on).constData());
+        // The reply to the command says it already, so a client needs no second request to know.
+        QCOMPARE(on.value("secretsHidden").toBool(), true);
+        const QJsonObject tree = ask("getTree", {{"depth", 20}});
+        QVERIFY(!text(tree).contains(kSecret));
+        QCOMPARE(tree.value("secretsHidden").toBool(), true);
+        QVERIFY(property("password", "text").value("hidden").toBool());
+    }
+
+    // Nothing turns it off again: not a second command, and no parameter.
+    void theCommand_cannotBeTakenBack()
+    {
+        useANewClient();
+        QVERIFY(ask("hideSecrets").value("ok").toBool());
+        for (const QJsonObject &params : {QJsonObject{{"hide", false}}, QJsonObject{{"enabled", false}}, QJsonObject{{"value", 0}}, QJsonObject{}}) {
+            QVERIFY(ask("hideSecrets", params).value("secretsHidden").toBool());
+            QVERIFY2(!text(ask("getTree", {{"depth", 20}})).contains(kSecret), text(params).constData());
+        }
+        QVERIFY(ask("setProperty", {{"objectId", idOf("password")}, {"property", "echoMode"}, {"value", 0}}).contains("error"));
+    }
+
+    // Two clients of one server, one with the hiding and one without: each gets its own kind of reply, in any
+    // order of their requests. (The texts of the password fields are looked up for one command only.)
+    void twoClients_doNotAffectEachOther()
+    {
+        InspectorServer::Session hiding, plain;
+        QVERIFY(askAs(hiding, "hideSecrets").value("ok").toBool());
+        const QJsonObject tree{{"depth", 20}};
+        const QJsonObject byValue{{"property", "text"}, {"value", kSecret}};
+        const auto checkHiding = [&] {
+            const QJsonObject reply = askAs(hiding, "getTree", tree);
+            QVERIFY(!text(reply).contains(kSecret));
+            QCOMPARE(reply.value("secretsHidden").toBool(), true);
+            QVERIFY(reply.value("hiddenCount").toInt() > 0);
+            QCOMPARE(askAs(hiding, "findByProperty", byValue).value("count").toInt(), 0);
+        };
+        const auto checkPlain = [&] {
+            const QJsonObject reply = askAs(plain, "getTree", tree);
+            QVERIFY(text(reply).contains(kSecret));
+            QVERIFY(!reply.contains("secretsHidden"));
+            QVERIFY(!reply.contains("hiddenCount"));
+            QVERIFY(askAs(plain, "findByProperty", byValue).value("count").toInt() >= 2);
+            const QJsonObject error = askAs(plain, "evaluate", {{"expression", "(function(){ throw new Error('got ' + children[0].text); })()"}});
+            QVERIFY(error.value("error").toString().contains(kSecret));
+        };
+        for (int round = 0; round < 3; ++round) {
+            checkHiding();
+            checkPlain();
+            checkPlain();
+            checkHiding();
+        }
+        // A client that comes later starts without the hiding.
+        InspectorServer::Session late;
+        QVERIFY(text(askAs(late, "getTree", tree)).contains(kSecret));
+    }
+
+    // A request of one client that runs while a command of another client is not finished changes nothing for the
+    // outer one, in either direction.
+    void aCommandInsideACommand_doesNotChangeTheOuterClient()
+    {
+        auto *inner = new Reentrant(m_root.get());
+        inner->setObjectName("reentrant");
+        inner->server = m_serverOwner.get();
+        // The result of the script is the text of the password field: it shows whose rule the outer command follows.
+        const QJsonObject call{{"objectId", idOf("reentrant")}, {"expression", "askAsOther()"}};
+        QVERIFY(!call.value("objectId").toString().isEmpty());
+
+        // Outside a client with the hiding, inside one without.
+        InspectorServer::Session plain;
+        inner->session = &plain;
+        QJsonObject outer = ask("evaluate", call);
+        QVERIFY2(outer.value("ok").toBool(), text(outer).constData());
+        QVERIFY(text(inner->lastReply).contains(kSecret));
+        QVERIFY(!inner->lastReply.contains("secretsHidden"));
+        QVERIFY2(!text(outer).contains(kSecret), text(outer).constData());
+        QVERIFY(outer.value("result").isNull());
+        QCOMPARE(outer.value("secretsHidden").toBool(), true);
+        QCOMPARE(outer.value("hiddenCount").toInt(), 1);
+
+        // Outside a client without the hiding, inside one with it.
+        inner->session = &m_session;
+        outer = askAs(plain, "evaluate", call);
+        QVERIFY(!text(inner->lastReply).contains(kSecret));
+        QCOMPARE(inner->lastReply.value("secretsHidden").toBool(), true);
+        QCOMPARE(outer.value("result").toString(), QString(kSecret));
+        QVERIFY(!outer.contains("secretsHidden"));
+        QVERIFY(!outer.contains("hiddenCount"));
+    }
+
+    // The same over real connections: the state is kept for the connection that sent the command, and ends with it.
+    void overTheSocket_theHidingBelongsToOneConnection()
+    {
+        m_serverOwner->start(0);
+        QVERIFY(m_serverOwner->port() > 0);
+        const QJsonObject tree{{"depth", 20}};
+        QTcpSocket first, second;
+        QVERIFY(connectTo(first, m_serverOwner->port()));
+        QVERIFY(connectTo(second, m_serverOwner->port()));
+        QVERIFY(text(askOver(first, "getTree", tree)).contains(kSecret));
+        QCOMPARE(askOver(first, "hideSecrets").value("secretsHidden").toBool(), true);
+        for (int round = 0; round < 2; ++round) {
+            const QJsonObject hidden = askOver(first, "getTree", tree);
+            QVERIFY(hidden.value("ok").toBool());
+            QVERIFY(!text(hidden).contains(kSecret));
+            QCOMPARE(hidden.value("secretsHidden").toBool(), true);
+            const QJsonObject shown = askOver(second, "getTree", tree);
+            QVERIFY(text(shown).contains(kSecret));
+            QVERIFY(!shown.contains("secretsHidden"));
+        }
+        // A new connection of the same client starts without it: the client sends the command again.
+        first.disconnectFromHost();
+        QTcpSocket again;
+        QVERIFY(connectTo(again, m_serverOwner->port()));
+        QVERIFY(text(askOver(again, "getTree", tree)).contains(kSecret));
+    }
+
+    // With a token the command is a command like any other: before the token it is refused and the connection is closed.
+    void overTheSocket_withAToken_theCommandNeedsTheTokenFirst()
+    {
+        m_serverOwner->setAuthToken(TOKEN);
+        m_serverOwner->start(0);
+        QVERIFY(m_serverOwner->port() > 0);
+        QTcpSocket early;
+        QVERIFY(connectTo(early, m_serverOwner->port()));
+        const QJsonObject refused = askOver(early, "hideSecrets");
+        QVERIFY2(refused.value("error").toString().startsWith("Authentication required"), text(refused).constData());
+        QVERIFY(!refused.contains("secretsHidden"));
+        QVERIFY(QTest::qWaitFor([&early] { return early.state() == QAbstractSocket::UnconnectedState; }, 2000));
+
+        QTcpSocket good;
+        QVERIFY(connectTo(good, m_serverOwner->port()));
+        QCOMPARE(askOver(good, "auth", {{"token", TOKEN}}).value("auth").toString(), QString("accepted"));
+        QCOMPARE(askOver(good, "hideSecrets").value("secretsHidden").toBool(), true);
+        QVERIFY(!text(askOver(good, "getTree", {{"depth", 20}})).contains(kSecret));
+    }
+
+    // Dial-out mode: the relay client is one client. It gets the texts until the relay sends the command, and
+    // none after that, for as long as the app runs.
+    void relay_theCommandTurnsTheHidingOnForTheRelay()
+    {
+        InspectorRelayClient relay(m_serverOwner.get(), QUrl("http://localhost:1"), TOKEN);
+        const QJsonObject tree{{"id", 1}, {"command", "getTree"}, {"params", QJsonObject{{"depth", 20}}}};
+        const QJsonObject before = relay.run(tree);
+        QVERIFY(before.value("ok").toBool());
+        QVERIFY(text(before).contains(kSecret));
+        QVERIFY(!before.contains("secretsHidden"));
+        const QJsonObject on = relay.run(QJsonObject{{"id", 2}, {"command", "hideSecrets"}});
+        QVERIFY2(on.value("ok").toBool(), text(on).constData());
+        QCOMPARE(on.value("id").toInt(), 2);
+        for (int round = 0; round < 2; ++round) {
+            const QJsonObject after = relay.run(tree);
+            QVERIFY(!text(after).contains(kSecret));
+            QCOMPARE(after.value("secretsHidden").toBool(), true);
+        }
+        // A client of the listening kind is not changed by it.
+        useANewClient();
+        QVERIFY(text(ask("getTree", {{"depth", 20}})).contains(kSecret));
+        // The commands that change the app stay refused.
+        QVERIFY(relay.run(QJsonObject{{"id", 3}, {"command", "setProperty"}}).value("error").toString().startsWith("Not available through a relay"));
     }
 };
 

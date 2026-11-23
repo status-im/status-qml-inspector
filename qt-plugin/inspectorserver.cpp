@@ -53,6 +53,9 @@
 
 #include <algorithm>
 
+// What a connection has asked for with "hideSecrets" is kept on its socket under this name.
+static const char kHideSecretsProperty[] = "_qmlinspector_hideSecrets";
+
 InspectorServer::InspectorServer(QObject *parent)
     : QObject(parent)
 {
@@ -456,10 +459,14 @@ void InspectorServer::readFrom(QTcpSocket *socket)
             return;
         }
 
-        QJsonObject response = handleCommand(request);
+        // What this connection has asked for is kept on its socket, so it ends with the connection.
+        Session session;
+        session.hideSecrets = socket->property(kHideSecretsProperty).toBool();
+        QJsonObject response = handleCommand(request, session);
         // The command can have ended this connection (the server was stopped from inside the app).
         if (!m_clients.contains(socket))
             return;
+        socket->setProperty(kHideSecretsProperty, session.hideSecrets);
         sendResponse(socket, response);
     }
 }
@@ -504,7 +511,7 @@ void InspectorServer::sendResponse(QTcpSocket *socket, const QJsonObject &respon
 
 // --- Command dispatch ---
 
-QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
+QJsonObject InspectorServer::handleCommand(const QJsonObject &request, Session &session)
 {
     QString command = request.value("command").toString();
     QJsonObject params = request.value("params").toObject();
@@ -512,11 +519,23 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
 
     QJsonObject result;
 
-    // What password fields hold is left out of the replies. Their texts are looked up when the first text
+    // For a client that has asked for it (the command "hideSecrets"), what password fields hold is left out of the
+    // replies. m_hideSecrets holds this for the command that runs, and for no longer: the next command sets it
+    // again from its own client. Their texts are looked up when the first text
     // of a reply is checked (see secrets()), and not before: a command that sends no text back, such as a
     // read of "pressed", does not walk the tree for it. They are looked up again for each command.
+    // A command can run inside another one: code of the app that a command runs (a method, a click handler with a
+    // dialog) can let the server read its sockets. What the outer command works with is put back when this one ends.
+    const bool outerHides = m_hideSecrets;
+    const int outerHiddenCount = m_hiddenCount;
+
+    // Nothing is kept from the command before: it may have been another client's.
+    m_secrets.clear();
     m_secretsCollected = false;
     m_hiddenCount = 0;
+    if (command == "hideSecrets")
+        session.hideSecrets = true;   // for this client, from this reply on. Nothing turns it off again.
+    m_hideSecrets = session.hideSecrets;
 
     if (command == "getTree")
         result = cmdGetTree(params);
@@ -552,11 +571,14 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
         result = cmdListFileDialogs(params);
     else if (command == "fileDialogAction")
         result = cmdFileDialogAction(params);
+    else if (command == "hideSecrets")
+        result = okResult({});
     else
         result = errorResult(QString("Unknown command: %1").arg(command));
 
-    // Tells a client that this plugin hides the text of password fields itself.
-    if (isOk(result))
+    // Tells a client that this plugin hides the text of password fields itself. Without it a client that must
+    // not pass these texts on (the MCP server) hides them itself.
+    if (m_hideSecrets && isOk(result))
         result["secretsHidden"] = true;
     // And how many values it left out of this reply or did not compare. A hidden value is null wherever it is
     // (a property, an entry of a list, a result); without this number a client could not tell it from a real null.
@@ -565,6 +587,11 @@ QJsonObject InspectorServer::handleCommand(const QJsonObject &request)
 
     if (id >= 0)
         result["id"] = id;
+
+    // Back to the command this one ran inside, if any. Its texts are looked up again: they were this client's.
+    m_hideSecrets = outerHides;
+    m_hiddenCount = outerHiddenCount;
+    m_secretsCollected = false;
 
     return result;
 }
@@ -584,6 +611,12 @@ static bool hidesText(QObject *obj)
         return false;
     const QVariant mode = obj->property("echoMode");
     return mode.isValid() && mode.toInt() != 0;
+}
+
+// Such a field, when the hiding is on. With the hiding off no field counts: every text is sent as it is.
+bool InspectorServer::hidesTextOf(QObject *obj) const
+{
+    return m_hideSecrets && hidesText(obj);
 }
 
 // The properties of such a field that hold what was typed.
@@ -620,8 +653,13 @@ void InspectorServer::collectSecrets()
 }
 
 // The texts that password fields hold now. Collected once per command, on first use.
+// With the hiding off there are none, and the tree is not walked for them.
 const QSet<QString> &InspectorServer::secrets()
 {
+    if (!m_hideSecrets) {
+        static const QSet<QString> none;
+        return none;
+    }
     if (!m_secretsCollected) {
         collectSecrets();
         m_secretsCollected = true;
@@ -754,7 +792,7 @@ QJsonObject InspectorServer::cmdGetProperties(const QJsonObject &params)
     // should ask for two.
     if (params.contains("names")) {
         const QMetaObject *meta = obj->metaObject();
-        const bool hides = hidesText(obj);
+        const bool hides = hidesTextOf(obj);
         QJsonArray props;
         const QJsonArray names = params.value("names").toArray();
         for (const QJsonValue &entry : names) {
@@ -814,9 +852,9 @@ QJsonObject InspectorServer::cmdSetProperty(const QJsonObject &params)
     if (!obj)
         return errorResult("Object not found: " + objectId);
 
-    // A field that hides its text cannot be made to show it through the inspector. (The app can still show it:
-    // then the text is on the screen, and it is sent.)
-    if (propName == QLatin1String("echoMode") && hidesText(obj))
+    // With the hiding on, a field that hides its text cannot be made to show it through the inspector.
+    // (The app can still show it: then the text is on the screen, and it is sent.)
+    if (propName == QLatin1String("echoMode") && hidesTextOf(obj))
         return errorResult("The echoMode of a field that hides its text cannot be set through the inspector");
 
     // Try meta-property first for proper type conversion
@@ -981,7 +1019,7 @@ QJsonObject InspectorServer::cmdFindByProperty(const QJsonObject &params)
         QVariant val = obj->property(propName.toUtf8().constData());
         // A hidden value is never compared: a match would tell the client what it is.
         const bool hidden = val.isValid()
-            && ((isTypedTextProperty(propName.toUtf8()) && hidesText(obj)) || isSecretValue(val));
+            && ((isTypedTextProperty(propName.toUtf8()) && hidesTextOf(obj)) || isSecretValue(val));
         // The same for a list or a map that holds such a text. It is counted, so that the client knows
         // that some values were not compared (the number does not depend on the value that is searched).
         if (hasMatchValue && (hidden || (val.isValid() && holdsSecret(val)))) {
@@ -1435,7 +1473,7 @@ QJsonObject InspectorServer::cmdFindAndClick(const QJsonObject &params)
         QVariant textVal = obj->property("text");
         if (!textVal.isValid())
             continue;
-        if (hidesText(obj) || isSecretValue(textVal)) {
+        if (hidesTextOf(obj) || isSecretValue(textVal)) {
             ++m_hiddenCount;
             continue;
         }
@@ -1528,7 +1566,7 @@ QJsonObject InspectorServer::cmdListInteractive(const QJsonObject &params)
                 entry["objectName"] = obj->objectName();
 
                 QVariant textVal = obj->property("text");
-                if (hidesText(obj) || isSecretValue(textVal)) {
+                if (hidesTextOf(obj) || isSecretValue(textVal)) {
                     entry["secret"] = true;
                     ++m_hiddenCount;
                 } else if (textVal.isValid() && !textVal.toString().isEmpty())
@@ -1769,12 +1807,13 @@ QJsonObject InspectorServer::serializeObject(QObject *obj, int maxDepth, int cur
     static const char* identifyingProps[] = {
         "text", "title", "placeholderText", "source", "currentText", "label", nullptr
     };
-    // A password field: its text is left out. "echoMode" is sent for every such field,
-    // so a client can tell a field that shows its text from one that hides it.
-    const bool hides = hidesText(obj);
+    // A password field: with the hiding on its text is left out. "echoMode" is sent for every such field,
+    // so a client can tell a field that shows its text from one that hides it. The mark and the length are sent
+    // in both modes: they change no value, and a client that hides the text itself can go by them.
+    const bool hides = hidesTextOf(obj);
     if (isEchoField(obj)) {
         result["echoMode"] = obj->property("echoMode").toInt();
-        if (hides) {
+        if (hidesText(obj)) {
             result["secret"] = true;
             result["textLength"] = obj->property("text").toString().size();
         }
@@ -1859,7 +1898,7 @@ QJsonArray InspectorServer::serializeProperties(QObject *obj)
 {
     QJsonArray props;
     const QMetaObject *meta = obj->metaObject();
-    const bool hides = hidesText(obj);
+    const bool hides = hidesTextOf(obj);
 
     for (int i = 0; i < meta->propertyCount(); ++i) {
         QMetaProperty prop = meta->property(i);
